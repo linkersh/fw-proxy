@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { ALLOWED_MODELS, ALLOWED_MODEL_IDS } from "./models";
 
 const FIREWORKS_BASE = "https://api.fireworks.ai/inference/v1";
@@ -23,6 +24,110 @@ if (PROXY_KEYS.size === 0) {
 }
 
 const PORT = parseInt(process.env.PORT || "3000");
+const HEALTH_INTERVAL_MS = 60_000; // 1 minute
+const HEALTH_RETENTION_MS = 6 * 60 * 60 * 1000; // 6 hours
+
+// ---------- database ----------
+
+const db = new Database("health.db", { create: true });
+db.exec("PRAGMA journal_mode = WAL");
+db.exec(`
+  CREATE TABLE IF NOT EXISTS health_checks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    model TEXT NOT NULL,
+    status INTEGER NOT NULL,
+    latency_ms INTEGER NOT NULL,
+    ttft_ms INTEGER,
+    error TEXT,
+    checked_at INTEGER NOT NULL
+  )
+`);
+db.exec(`DELETE FROM health_checks WHERE checked_at < (unixepoch('now') * 1000 - ${HEALTH_RETENTION_MS})`);
+
+const stmtInsert = db.prepare(
+  "INSERT INTO health_checks (model, status, latency_ms, ttft_ms, error, checked_at) VALUES (?, ?, ?, ?, ?, ?)"
+);
+const stmtCleanup = db.prepare(
+  `DELETE FROM health_checks WHERE checked_at < (unixepoch('now') * 1000 - ${HEALTH_RETENTION_MS})`
+);
+
+// ---------- health checker ----------
+
+interface HealthResult {
+  model: string;
+  status: number;
+  latency_ms: number;
+  ttft_ms: number | null;
+  error: string | null;
+}
+
+async function runHealthCheck(model: string): Promise<HealthResult> {
+  const start = Date.now();
+  try {
+    const res = await fetch(`${FIREWORKS_BASE}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model,
+        messages: [{ role: "user", content: "say hello" }],
+        stream: true,
+        max_tokens: 5,
+      }),
+    });
+
+    let ttft: number | null = null;
+
+    if (res.ok && res.body) {
+      // Read first chunk to measure time to first token
+      const reader = res.body.getReader();
+      const { value } = await reader.read();
+      if (value) ttft = Date.now() - start;
+      // Drain the rest
+      try { await reader.cancel(); } catch {}
+    }
+
+    const latency = Date.now() - start;
+    const result: HealthResult = {
+      model,
+      status: res.status,
+      latency_ms: latency,
+      ttft_ms: ttft,
+      error: res.ok ? null : await res.text().catch(() => "unknown error"),
+    };
+    return result;
+  } catch (err: any) {
+    return {
+      model,
+      status: 0,
+      latency_ms: Date.now() - start,
+      ttft_ms: null,
+      error: err.message || "fetch failed",
+    };
+  }
+}
+
+function recordCheck(result: HealthResult) {
+  stmtInsert.run(result.model, result.status, result.latency_ms, result.ttft_ms, result.error, Date.now());
+  // Periodically clean old records
+  stmtCleanup.run();
+}
+
+async function runAllHealthChecks() {
+  const models = ALLOWED_MODELS.filter((m) => m.id !== "accounts/fireworks/routers/glm-5-fast");
+  for (const model of models) {
+    const result = await runHealthCheck(model.id);
+    recordCheck(result);
+    const icon = result.status === 200 ? "✅" : "❌";
+    console.log(`  ${icon} ${model.id} — ${result.status} (${result.latency_ms}ms, ttft: ${result.ttft_ms ?? "n/a"}ms)`);
+  }
+}
+
+// Start the health check loop
+setTimeout(() => runAllHealthChecks(), 2000); // initial after 2s
+setInterval(runAllHealthChecks, HEALTH_INTERVAL_MS);
 
 // ---------- auth ----------
 
@@ -234,6 +339,137 @@ async function proxyWithBody(req: Request): Promise<Response> {
   }
 }
 
+// ---------- health dashboard ----------
+
+function getStats(modelId: string) {
+  const cutoff = Date.now() - HEALTH_RETENTION_MS;
+  const rows = db.prepare(
+    "SELECT status, latency_ms, ttft_ms, error, checked_at FROM health_checks WHERE model = ? AND checked_at > ? ORDER BY checked_at ASC"
+  ).all(modelId, cutoff) as any[];
+
+  if (rows.length === 0) {
+    return { total: 0, up: 0, down: 0, uptimePct: 0, avgLatency: 0, avgTtft: 0, p50Latency: 0, p99Latency: 0, lastCheck: null, currentStatus: "unknown", checks: [] };
+  }
+
+  const up = rows.filter((r: any) => r.status === 200).length;
+  const down = rows.length - up;
+  const latencies = rows.filter((r: any) => r.status === 200).map((r: any) => r.latency_ms);
+  const ttfts = rows.filter((r: any) => r.ttft_ms != null).map((r: any) => r.ttft_ms);
+
+  const sorted = [...latencies].sort((a: number, b: number) => a - b);
+  const p50 = sorted.length ? sorted[Math.floor(sorted.length * 0.5)] : 0;
+  const p99 = sorted.length ? sorted[Math.floor(sorted.length * 0.99)] : 0;
+
+  return {
+    total: rows.length,
+    up,
+    down,
+    uptimePct: Math.round((up / rows.length) * 1000) / 10,
+    avgLatency: latencies.length ? Math.round(latencies.reduce((a: number, b: number) => a + b, 0) / latencies.length) : 0,
+    avgTtft: ttfts.length ? Math.round(ttfts.reduce((a: number, b: number) => a + b, 0) / ttfts.length) : 0,
+    p50Latency: p50,
+    p99Latency: p99,
+    lastCheck: rows[rows.length - 1].checked_at,
+    currentStatus: rows[rows.length - 1].status === 200 ? "up" : "down",
+    checks: rows.map((r: any) => ({
+      status: r.status,
+      latency_ms: r.latency_ms,
+      ttft_ms: r.ttft_ms,
+      error: r.error,
+      checked_at: r.checked_at,
+    })),
+  };
+}
+
+function renderHealthPage(): Response {
+  const models = ALLOWED_MODELS.filter((m) => m.id !== "accounts/fireworks/routers/glm-5-fast");
+  const stats = models.map((m) => ({ ...m, stats: getStats(m.id) }));
+
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Fireworks Proxy — Status</title>
+<style>
+  :root { --bg: #0d1117; --card: #161b22; --border: #30363d; --text: #e6edf3; --muted: #8b949e; --green: #3fb950; --red: #f85149; --yellow: #d29922; --blue: #58a6ff; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); padding: 24px; min-height: 100vh; }
+  h1 { font-size: 1.5rem; margin-bottom: 4px; }
+  .subtitle { color: var(--muted); margin-bottom: 24px; font-size: 0.85rem; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); gap: 16px; margin-bottom: 24px; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 20px; }
+  .card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+  .model-name { font-weight: 600; font-size: 1rem; }
+  .badge { padding: 3px 10px; border-radius: 999px; font-size: 0.75rem; font-weight: 600; }
+  .badge-up { background: rgba(63,185,80,0.15); color: var(--green); }
+  .badge-down { background: rgba(248,81,73,0.15); color: var(--red); }
+  .badge-unknown { background: rgba(139,148,158,0.15); color: var(--muted); }
+  .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 16px; }
+  .stat { text-align: center; }
+  .stat-value { font-size: 1.3rem; font-weight: 700; }
+  .stat-label { font-size: 0.7rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
+  .stat-green { color: var(--green); }
+  .stat-red { color: var(--red); }
+  .stat-blue { color: var(--blue); }
+  .timeline { display: flex; gap: 2px; height: 32px; align-items: flex-end; border-radius: 4px; overflow: hidden; }
+  .tick { flex: 1; min-width: 3px; border-radius: 2px 2px 0 0; transition: opacity 0.15s; }
+  .tick:hover { opacity: 0.7; }
+  .tick-ok { background: var(--green); }
+  .tick-err { background: var(--red); }
+  .tick-title { font-size: 0.65rem; color: var(--muted); text-align: center; margin-top: 4px; }
+  .uptime-bar { height: 6px; background: var(--border); border-radius: 3px; margin-bottom: 16px; overflow: hidden; }
+  .uptime-fill { height: 100%; border-radius: 3px; background: var(--green); transition: width 0.3s; }
+  .footer { text-align: center; color: var(--muted); font-size: 0.75rem; margin-top: 32px; }
+</style>
+</head>
+<body>
+<h1>🔥 Fireworks Proxy</h1>
+<p class="subtitle">Model health monitor — checking every 60s, 6h history</p>
+<div class="grid">
+${stats.map((m: any) => {
+  const s = m.stats;
+  const barWidth = s.total > 0 ? s.uptimePct : 0;
+  const maxLat = Math.max(...s.checks.map((c: any) => c.latency_ms), 1);
+  return `
+  <div class="card">
+    <div class="card-header">
+      <span class="model-name">${m.name}</span>
+      <span class="badge badge-${s.currentStatus}">${s.currentStatus === "up" ? "● UP" : s.currentStatus === "down" ? "● DOWN" : "○ UNKNOWN"}</span>
+    </div>
+    <div class="uptime-bar"><div class="uptime-fill" style="width:${barWidth}%"></div></div>
+    <div class="stats">
+      <div class="stat"><div class="stat-value stat-green">${s.uptimePct}%</div><div class="stat-label">Uptime</div></div>
+      <div class="stat"><div class="stat-value stat-blue">${s.avgLatency}ms</div><div class="stat-label">Avg Latency</div></div>
+      <div class="stat"><div class="stat-value stat-blue">${s.avgTtft}ms</div><div class="stat-label">Avg TTFT</div></div>
+    </div>
+    <div class="stats">
+      <div class="stat"><div class="stat-value">${s.p50Latency}ms</div><div class="stat-label">p50 Latency</div></div>
+      <div class="stat"><div class="stat-value">${s.p99Latency}ms</div><div class="stat-label">p99 Latency</div></div>
+      <div class="stat"><div class="stat-value">${s.up}/${s.total}</div><div class="stat-label">Checks OK</div></div>
+    </div>
+    <div class="timeline">
+      ${s.checks.map((c: any) => {
+        const h = Math.max(4, Math.round((c.latency_ms / maxLat) * 32));
+        const cls = c.status === 200 ? "tick-ok" : "tick-err";
+        const time = new Date(c.checked_at).toLocaleTimeString();
+        return `<div class="tick ${cls}" style="height:${h}px" title="${time} — ${c.status} (${c.latency_ms}ms, ttft: ${c.ttft_ms ?? 'n/a'}ms)"></div>`;
+      }).join("")}
+    </div>
+    <div class="tick-title">last 6h (${s.checks.length} checks)</div>
+  </div>`;
+}).join("")}
+</div>
+<div class="footer">Last refresh: ${new Date().toLocaleString()} · Auto-refreshes every 60s</div>
+<script>setTimeout(() => location.reload(), 60000);</script>
+</body>
+</html>`;
+
+  return new Response(html, {
+    headers: { "Content-Type": "text/html; charset=utf-8" },
+  });
+}
+
 // ---------- server ----------
 
 const server = Bun.serve({
@@ -242,9 +478,9 @@ const server = Bun.serve({
     const url = new URL(req.url);
     const path = url.pathname;
 
-    // Health check (no auth required)
+    // Health dashboard (no auth required)
     if (path === "/health") {
-      return jsonResponse(200, { status: "ok" });
+      return renderHealthPage();
     }
 
     // Everything else requires a valid proxy API key
@@ -287,6 +523,8 @@ console.log(`
      POST /v1/completions
      POST /v1/embeddings
      GET  /v1/models
+
+   Dashboard: http://localhost:${PORT}/health
 
    Authentication: Bearer <proxy-api-key> (${PROXY_KEYS.size} key(s) configured)
 
