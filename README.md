@@ -22,9 +22,9 @@ cp .env.example .env
 ## Run
 
 ```bash
-bun run dev          # development (watch mode)
-bun run start        # production
-docker compose up -d # Docker
+bun run dev             # development (watch mode)
+bun run start           # production (port 3000)
+docker compose up -d    # Docker (port 13312)
 ```
 
 ## Authentication
@@ -49,6 +49,17 @@ All `POST /v1/*` requests are transparently proxied to Fireworks after authentic
 
 Point any OpenAI-compatible client at the proxy. The user's `apiKey` is one of the `PROXY_API_KEYS` values:
 
+**Docker (port 13312):**
+```ts
+import OpenAI from "openai";
+
+const client = new OpenAI({
+  baseURL: "http://localhost:13312/v1",
+  apiKey: "key-abc123", // one of the proxy keys, NOT the Fireworks key
+});
+```
+
+**Local/dev (port 3000):**
 ```ts
 import OpenAI from "openai";
 
