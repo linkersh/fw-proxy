@@ -129,11 +129,10 @@ function validateModel(
   return { valid: true };
 }
 
-/** Rewrite the URL: strip the /v1 prefix since FIREWORKS_BASE already includes it */
+/** Rewrite the URL: strip /v1 prefix and all query params */
 function rewriteUrl(incoming: string): string {
   const url = new URL(incoming, "http://placeholder");
-  // path is e.g. /v1/chat/completions -> strip /v1 -> /chat/completions
-  const path = url.pathname.replace(/^\/v1/, "") + url.search;
+  const path = url.pathname.replace(/^\/v1/, "");
   return FIREWORKS_BASE + path;
 }
 
