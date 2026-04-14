@@ -134,58 +134,64 @@ function transformSSEStream(body: ReadableStream<Uint8Array>): ReadableStream<Ui
   const reader = body.getReader();
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
+  let leftover = ""; // buffer for lines split across reads
 
   return new ReadableStream({
     async pull(controller) {
       const { done, value } = await reader.read();
       if (done) {
+        // Flush any remaining partial line
+        if (leftover) {
+          controller.enqueue(encoder.encode(transformLine(leftover) + "\n"));
+          leftover = "";
+        }
         controller.close();
         return;
       }
 
-      const text = decoder.decode(value, { stream: true });
+      const text = leftover + decoder.decode(value, { stream: true });
       const lines = text.split("\n");
+      // Last element is either empty (text ended with \n) or an incomplete line
+      leftover = lines.pop()!;
+
       const out: string[] = [];
-
       for (const line of lines) {
-        if (!line.startsWith("data: ")) {
-          out.push(line);
-          continue;
-        }
-
-        const payload = line.slice(6).trim();
-        if (payload === "[DONE]") {
-          out.push(line);
-          continue;
-        }
-
-        try {
-          const chunk = JSON.parse(payload);
-          const choices = chunk.choices;
-          if (Array.isArray(choices)) {
-            for (const choice of choices) {
-              // Move reasoning_content/reasoning from choice-level into delta
-              for (const field of ["reasoning_content", "reasoning", "reasoning_text"]) {
-                if (choice[field] != null && choice[field] !== "") {
-                  if (!choice.delta) choice.delta = {};
-                  if (choice.delta[field] == null) {
-                    choice.delta[field] = choice[field];
-                  }
-                  delete choice[field];
-                }
-              }
-            }
-          }
-          out.push(`data: ${JSON.stringify(chunk)}`);
-        } catch {
-          // Can't parse — pass through unchanged
-          out.push(line);
-        }
+        out.push(transformLine(line));
       }
+      out.push(""); // trailing newline after the batch
 
       controller.enqueue(encoder.encode(out.join("\n")));
     },
   });
+}
+
+/** Transform a single SSE line — move reasoning fields into delta */
+function transformLine(line: string): string {
+  if (!line.startsWith("data: ")) return line;
+
+  const payload = line.slice(6).trim();
+  if (payload === "[DONE]") return line;
+
+  try {
+    const chunk = JSON.parse(payload);
+    const choices = chunk.choices;
+    if (Array.isArray(choices)) {
+      for (const choice of choices) {
+        for (const field of ["reasoning_content", "reasoning", "reasoning_text"]) {
+          if (choice[field] != null && choice[field] !== "") {
+            if (!choice.delta) choice.delta = {};
+            if (choice.delta[field] == null) {
+              choice.delta[field] = choice[field];
+            }
+            delete choice[field];
+          }
+        }
+      }
+    }
+    return `data: ${JSON.stringify(chunk)}`;
+  } catch {
+    return line; // can't parse — pass through unchanged
+  }
 }
 
 /** Rewrite the URL: strip /v1 prefix and all query params */
