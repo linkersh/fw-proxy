@@ -166,8 +166,7 @@ async function proxyWithBody(req: Request): Promise<Response> {
   const headers = new Headers();
   headers.set("Authorization", `Bearer ${API_KEY}`);
   headers.set("Content-Type", "application/json");
-
-  // Forward select headers from the client
+  // Only forward Accept from client — nothing else
   if (req.headers.has("Accept")) headers.set("Accept", req.headers.get("Accept")!);
 
   const isStream = bodyText.includes('"stream":true') || bodyText.includes('"stream": true');
@@ -179,30 +178,39 @@ async function proxyWithBody(req: Request): Promise<Response> {
   });
 
   if (!upstream.ok && !isStream) {
-    // Try to surface the upstream error
+    // Surface the upstream error with clean headers
     const errBody = await upstream.text();
     return new Response(errBody, {
       status: upstream.status,
-      headers: { "Content-Type": "application/json" },
-    });
-  }
-
-  // For streaming, just pipe through
-  if (isStream && upstream.body) {
-    return new Response(upstream.body, {
-      status: upstream.status,
       headers: {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        Connection: "keep-alive",
+        "Content-Type": "application/json",
+        "x-request-id": crypto.randomUUID(),
       },
     });
   }
 
-  // Non-streaming: pass through the response as-is
+  // Build clean response headers — only what OpenAI clients expect
+  const cleanHeaders = new Headers();
+  cleanHeaders.set("x-request-id", crypto.randomUUID());
+
+  if (isStream && upstream.body) {
+    cleanHeaders.set("Content-Type", "text/event-stream");
+    cleanHeaders.set("Cache-Control", "no-cache");
+    return new Response(upstream.body, {
+      status: upstream.status,
+      headers: cleanHeaders,
+    });
+  }
+
+  // Non-streaming
+  const ct = upstream.headers.get("Content-Type");
+  if (ct) cleanHeaders.set("Content-Type", ct);
+  const cl = upstream.headers.get("Content-Length");
+  if (cl) cleanHeaders.set("Content-Length", cl);
+
   return new Response(upstream.body, {
     status: upstream.status,
-    headers: upstream.headers,
+    headers: cleanHeaders,
   });
 }
 
