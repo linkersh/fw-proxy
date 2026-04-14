@@ -224,20 +224,31 @@ const server = Bun.serve({
     const authError = authenticateProxy(req);
     if (authError) return authError;
 
+    // Only allow specific endpoints
+    const ALLOWED_ENDPOINTS: Record<string, string> = {
+      "/v1/models": "GET",
+      "/v1/chat/completions": "POST",
+      "/v1/completions": "POST",
+      "/v1/embeddings": "POST",
+    };
+
+    const allowedMethod = ALLOWED_ENDPOINTS[path];
+    if (!allowedMethod) {
+      return openaiError(404, `Unknown route: ${path}`);
+    }
+    if (req.method !== allowedMethod) {
+      return openaiError(405, `Method ${req.method} not allowed for ${path}. Use ${allowedMethod}.`);
+    }
+
     // Models list – return only allowed models
-    if (path === "/v1/models" || path === "/models") {
+    if (path === "/v1/models") {
       return handleModels();
     }
 
-    // All other /v1/* routes: proxy with body validation
-    if (path.startsWith("/v1/") && req.method === "POST") {
-      const clone = req.clone();
-      clone.json().then((b) => console.log(`← ${req.method} ${path} model=${b.model ?? "?"}`)).catch(() => console.log(`← ${req.method} ${path}`));
-      return proxyWithBody(req);
-    }
-
-    // Catch-all
-    return openaiError(404, `Unknown route: ${path}`);
+    // POST endpoints: proxy with body validation
+    const clone = req.clone();
+    clone.json().then((b) => console.log(`← ${req.method} ${path} model=${b.model ?? "?"}`)).catch(() => console.log(`← ${req.method} ${path}`));
+    return proxyWithBody(req);
   },
 });
 
