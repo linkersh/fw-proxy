@@ -129,6 +129,65 @@ function validateModel(
   return { valid: true };
 }
 
+/** Transform SSE stream: move reasoning_content from choice-level into delta */
+function transformSSEStream(body: ReadableStream<Uint8Array>): ReadableStream<Uint8Array> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+
+  return new ReadableStream({
+    async pull(controller) {
+      const { done, value } = await reader.read();
+      if (done) {
+        controller.close();
+        return;
+      }
+
+      const text = decoder.decode(value, { stream: true });
+      const lines = text.split("\n");
+      const out: string[] = [];
+
+      for (const line of lines) {
+        if (!line.startsWith("data: ")) {
+          out.push(line);
+          continue;
+        }
+
+        const payload = line.slice(6).trim();
+        if (payload === "[DONE]") {
+          out.push(line);
+          continue;
+        }
+
+        try {
+          const chunk = JSON.parse(payload);
+          const choices = chunk.choices;
+          if (Array.isArray(choices)) {
+            for (const choice of choices) {
+              // Move reasoning_content/reasoning from choice-level into delta
+              for (const field of ["reasoning_content", "reasoning", "reasoning_text"]) {
+                if (choice[field] != null && choice[field] !== "") {
+                  if (!choice.delta) choice.delta = {};
+                  if (choice.delta[field] == null) {
+                    choice.delta[field] = choice[field];
+                  }
+                  delete choice[field];
+                }
+              }
+            }
+          }
+          out.push(`data: ${JSON.stringify(chunk)}`);
+        } catch {
+          // Can't parse — pass through unchanged
+          out.push(line);
+        }
+      }
+
+      controller.enqueue(encoder.encode(out.join("\n")));
+    },
+  });
+}
+
 /** Rewrite the URL: strip /v1 prefix and all query params */
 function rewriteUrl(incoming: string): string {
   const url = new URL(incoming, "http://placeholder");
@@ -196,22 +255,41 @@ async function proxyWithBody(req: Request): Promise<Response> {
   if (isStream && upstream.body) {
     cleanHeaders.set("Content-Type", "text/event-stream");
     cleanHeaders.set("Cache-Control", "no-cache");
-    return new Response(upstream.body, {
+    return new Response(transformSSEStream(upstream.body), {
       status: upstream.status,
       headers: cleanHeaders,
     });
   }
 
-  // Non-streaming
+  // Non-streaming: move reasoning fields into the message object for consistency
   const ct = upstream.headers.get("Content-Type");
   if (ct) cleanHeaders.set("Content-Type", ct);
   const cl = upstream.headers.get("Content-Length");
   if (cl) cleanHeaders.set("Content-Length", cl);
 
-  return new Response(upstream.body, {
-    status: upstream.status,
-    headers: cleanHeaders,
-  });
+  const responseBody = await upstream.text();
+  try {
+    const json = JSON.parse(responseBody);
+    const choices = json.choices;
+    if (Array.isArray(choices)) {
+      for (const choice of choices) {
+        const msg = choice.message;
+        if (msg && msg.reasoning_content == null) {
+          // Some models put reasoning at choice-level — move it into message
+          for (const field of ["reasoning_content", "reasoning", "reasoning_text"]) {
+            if (choice[field] != null) {
+              msg[field] = choice[field];
+              delete choice[field];
+            }
+          }
+        }
+      }
+    }
+    cleanHeaders.delete("Content-Length"); // body size changed
+    return new Response(JSON.stringify(json), { status: upstream.status, headers: cleanHeaders });
+  } catch {
+    return new Response(responseBody, { status: upstream.status, headers: cleanHeaders });
+  }
 }
 
 // ---------- server ----------
