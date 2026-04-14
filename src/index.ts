@@ -881,49 +881,50 @@ function renderHealthPage(rangeParam: string | null): Response {
   .overview-item span { display: block; color: var(--muted); font-size: 0.78rem; margin-bottom: 10px; }
   .overview-item strong { display: block; color: var(--text); font-size: 1.55rem; line-height: 1.05; }
   .overview-item small { display: block; color: var(--faint); margin-top: 9px; line-height: 1.35; }
-  .model-stack { display: grid; gap: 16px; }
-  .model-panel { background: rgba(21, 21, 19, 0.96); border: 1px solid var(--border); border-radius: 8px; padding: 18px; }
+  .model-stack { display: grid; grid-template-columns: repeat(auto-fit, minmax(600px, 1fr)); gap: 16px; }
+  @media (min-width: 1400px) { .model-stack { grid-template-columns: repeat(2, 1fr); } }
+  .model-panel { background: rgba(21, 21, 19, 0.96); border: 1px solid var(--border); border-radius: 8px; padding: 14px; display: flex; flex-direction: column; }
   .model-panel.status-up { border-color: rgba(123, 216, 143, 0.34); }
   .model-panel.status-down { border-color: rgba(255, 111, 97, 0.44); }
-  .model-header { display: flex; justify-content: space-between; gap: 20px; padding-bottom: 14px; border-bottom: 1px solid var(--border); }
+  .model-header { display: flex; justify-content: space-between; gap: 16px; padding-bottom: 10px; border-bottom: 1px solid var(--border); }
   .model-heading { display: flex; gap: 12px; min-width: 0; }
   .status-dot { width: 10px; height: 10px; border-radius: 5px; margin-top: 9px; flex: 0 0 auto; background: var(--faint); box-shadow: 0 0 0 4px rgba(116, 111, 102, 0.16); }
   .status-up .status-dot { background: var(--green); box-shadow: 0 0 0 4px rgba(123, 216, 143, 0.13); }
   .status-down .status-dot { background: var(--red); box-shadow: 0 0 0 4px rgba(255, 111, 97, 0.14); }
-  h2 { font-size: 1.28rem; line-height: 1.2; letter-spacing: 0; }
-  .model-id { color: var(--muted); margin-top: 7px; font-size: 0.82rem; overflow-wrap: anywhere; }
-  .model-meta { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 13px; }
-  .chip { border: 1px solid var(--border); background: var(--panel-soft); color: var(--muted); border-radius: 6px; padding: 4px 7px; font-size: 0.78rem; }
+  h2 { font-size: 1.1rem; line-height: 1.2; letter-spacing: 0; }
+  .model-id { color: var(--muted); margin-top: 4px; font-size: 0.75rem; overflow-wrap: anywhere; }
+  .model-meta { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .chip { border: 1px solid var(--border); background: var(--panel-soft); color: var(--muted); border-radius: 4px; padding: 2px 6px; font-size: 0.7rem; }
   .status-summary { text-align: right; flex: 0 0 auto; }
   .badge { display: inline-flex; align-items: center; border: 1px solid var(--border-strong); border-radius: 6px; padding: 6px 10px; font-size: 0.8rem; font-weight: 700; background: var(--panel-soft); }
   .badge-up { color: var(--green); border-color: rgba(123, 216, 143, 0.38); background: var(--green-dim); }
   .badge-down { color: var(--red); border-color: rgba(255, 111, 97, 0.42); background: var(--red-dim); }
   .badge-unknown { color: var(--muted); }
   .status-summary small { display: block; color: var(--muted); margin-top: 8px; font-size: 0.78rem; }
-  .metrics { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); border-bottom: 1px solid var(--border); }
-  .metric { min-width: 0; padding: 14px 14px 14px 0; border-right: 1px solid var(--border); }
+  .metrics { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); border-bottom: 1px solid var(--border); font-size: 0.9rem; }
+  .metric { min-width: 0; padding: 10px 10px 10px 0; border-right: 1px solid var(--border); }
   .metric:last-child { border-right: 0; padding-right: 0; }
-  .metric span { display: block; color: var(--muted); font-size: 0.78rem; margin-bottom: 8px; }
-  .metric strong { display: block; color: var(--text); font-size: 1.42rem; line-height: 1.08; font-weight: 720; overflow-wrap: anywhere; }
-  .metric small { display: block; color: var(--faint); margin-top: 8px; line-height: 1.35; font-size: 0.78rem; }
+  .metric span { display: block; color: var(--muted); font-size: 0.7rem; margin-bottom: 4px; }
+  .metric strong { display: block; color: var(--text); font-size: 1.1rem; line-height: 1.08; font-weight: 720; overflow-wrap: anywhere; }
+  .metric small { display: block; color: var(--faint); margin-top: 4px; line-height: 1.3; font-size: 0.7rem; }
   .metric-good strong { color: var(--green); }
   .metric-bad strong { color: var(--red); }
-  .history-row { padding: 16px 0; border-bottom: 1px solid var(--border); }
+  .history-row { padding: 10px 0; border-bottom: 1px solid var(--border); flex: 1; }
   .section-heading, .chart-heading { display: flex; justify-content: space-between; gap: 18px; align-items: flex-start; }
-  .section-heading h3, .chart-heading h3 { font-size: 0.98rem; line-height: 1.2; letter-spacing: 0; }
-  .section-heading p, .chart-heading p { color: var(--muted); margin-top: 6px; line-height: 1.45; font-size: 0.82rem; }
+  .section-heading h3, .chart-heading h3 { font-size: 0.85rem; line-height: 1.2; letter-spacing: 0; }
+  .section-heading p, .chart-heading p { color: var(--muted); margin-top: 2px; line-height: 1.4; font-size: 0.75rem; }
   .section-heading span, .chart-heading span { color: var(--faint); font-size: 0.78rem; white-space: nowrap; }
-  .status-strip { display: grid; gap: 2px; height: 28px; margin-top: 12px; }
+  .status-strip { display: grid; gap: 2px; height: 24px; margin-top: 8px; }
   .history-bucket { border-radius: 2px; min-width: 2px; transition: opacity 0.15s ease; }
   .history-bucket:hover { opacity: 0.7; }
   .bucket-empty { background: var(--empty); }
   .bucket-ok { background: var(--green); }
   .bucket-mixed { background: var(--amber); }
   .bucket-down { background: var(--red); }
-  .charts { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; padding-top: 16px; }
+  .charts { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; padding-top: 12px; }
   .chart-block { min-width: 0; }
-  .chart-canvas, .chart-empty { width: 100%; height: 140px; margin-top: 12px; border: 1px solid var(--border); border-radius: 8px; background: linear-gradient(180deg, rgba(244, 240, 232, 0.025), rgba(244, 240, 232, 0.008)); }
-  .chart-empty { display: grid; place-items: center; color: var(--muted); font-size: 0.86rem; }
+  .chart-canvas, .chart-empty { width: 100%; height: 100px; margin-top: 8px; border: 1px solid var(--border); border-radius: 8px; background: linear-gradient(180deg, rgba(244, 240, 232, 0.025), rgba(244, 240, 232, 0.008)); }
+  .chart-empty { display: grid; place-items: center; color: var(--muted); font-size: 0.8rem; }
   .chart-grid { stroke: var(--border-strong); stroke-width: 0.35; fill: none; vector-effect: non-scaling-stroke; }
   .chart-line { fill: none; stroke-width: 1.45; stroke-linecap: round; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
   .line-latency { stroke: var(--text); }
@@ -935,16 +936,21 @@ function renderHealthPage(rangeParam: string | null): Response {
   .legend .line-latency { background: var(--text); }
   .legend .line-ttft { background: var(--amber); }
   .legend .line-tps { background: var(--green); }
-  .error-note { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--border); color: var(--red); font-size: 0.84rem; line-height: 1.45; overflow-wrap: anywhere; }
+  .error-note { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--border); color: var(--red); font-size: 0.8rem; line-height: 1.4; overflow-wrap: anywhere; }
   .error-note span { color: var(--muted); margin-right: 8px; }
   .ok-note { color: var(--muted); }
   .footer { text-align: center; color: var(--faint); font-size: 0.78rem; margin-top: 24px; }
+  @media (max-width: 1200px) {
+    .model-stack { grid-template-columns: 1fr; }
+    .charts { grid-template-columns: 1fr; }
+  }
   @media (max-width: 980px) {
     .topbar, .model-header, .section-heading, .chart-heading { flex-direction: column; }
     .refresh, .status-summary { text-align: left; min-width: 0; }
     .overview { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-    .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-    .metric { border-right: 0; border-bottom: 1px solid var(--border); padding-right: 0; }
+    .metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .metric { border-right: 0; border-bottom: 1px solid var(--border); padding-right: 10px; }
+    .metric:nth-child(3n) { border-right: 0; }
     .metric:last-child { border-bottom: 0; }
     .charts { grid-template-columns: 1fr; }
   }
