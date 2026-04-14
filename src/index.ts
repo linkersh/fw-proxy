@@ -129,71 +129,6 @@ function validateModel(
   return { valid: true };
 }
 
-/** Transform SSE stream: move reasoning_content from choice-level into delta */
-function transformSSEStream(body: ReadableStream<Uint8Array>): ReadableStream<Uint8Array> {
-  const reader = body.getReader();
-  const decoder = new TextDecoder();
-  const encoder = new TextEncoder();
-  let leftover = ""; // buffer for lines split across reads
-
-  return new ReadableStream({
-    async pull(controller) {
-      const { done, value } = await reader.read();
-      if (done) {
-        // Flush any remaining partial line
-        if (leftover) {
-          controller.enqueue(encoder.encode(transformLine(leftover) + "\n"));
-          leftover = "";
-        }
-        controller.close();
-        return;
-      }
-
-      const text = leftover + decoder.decode(value, { stream: true });
-      const lines = text.split("\n");
-      // Last element is either empty (text ended with \n) or an incomplete line
-      leftover = lines.pop()!;
-
-      const out: string[] = [];
-      for (const line of lines) {
-        out.push(transformLine(line));
-      }
-      out.push(""); // trailing newline after the batch
-
-      controller.enqueue(encoder.encode(out.join("\n")));
-    },
-  });
-}
-
-/** Transform a single SSE line — move reasoning fields into delta */
-function transformLine(line: string): string {
-  if (!line.startsWith("data: ")) return line;
-
-  const payload = line.slice(6).trim();
-  if (payload === "[DONE]") return line;
-
-  try {
-    const chunk = JSON.parse(payload);
-    const choices = chunk.choices;
-    if (Array.isArray(choices)) {
-      for (const choice of choices) {
-        for (const field of ["reasoning_content", "reasoning", "reasoning_text"]) {
-          if (choice[field] != null && choice[field] !== "") {
-            if (!choice.delta) choice.delta = {};
-            if (choice.delta[field] == null) {
-              choice.delta[field] = choice[field];
-            }
-            delete choice[field];
-          }
-        }
-      }
-    }
-    return `data: ${JSON.stringify(chunk)}`;
-  } catch {
-    return line; // can't parse — pass through unchanged
-  }
-}
-
 /** Rewrite the URL: strip /v1 prefix and all query params */
 function rewriteUrl(incoming: string): string {
   const url = new URL(incoming, "http://placeholder");
@@ -261,7 +196,8 @@ async function proxyWithBody(req: Request): Promise<Response> {
   if (isStream && upstream.body) {
     cleanHeaders.set("Content-Type", "text/event-stream");
     cleanHeaders.set("Cache-Control", "no-cache");
-    return new Response(transformSSEStream(upstream.body), {
+    // Pipe Fireworks stream directly — they already put reasoning_content in delta
+    return new Response(upstream.body, {
       status: upstream.status,
       headers: cleanHeaders,
     });
