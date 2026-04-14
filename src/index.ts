@@ -38,6 +38,7 @@ db.exec(`
     status INTEGER NOT NULL,
     latency_ms INTEGER NOT NULL,
     ttft_ms INTEGER,
+    tps REAL,
     error TEXT,
     checked_at INTEGER NOT NULL
   )
@@ -45,7 +46,7 @@ db.exec(`
 db.exec(`DELETE FROM health_checks WHERE checked_at < (unixepoch('now') * 1000 - ${HEALTH_RETENTION_MS})`);
 
 const stmtInsert = db.prepare(
-  "INSERT INTO health_checks (model, status, latency_ms, ttft_ms, error, checked_at) VALUES (?, ?, ?, ?, ?, ?)"
+  "INSERT INTO health_checks (model, status, latency_ms, ttft_ms, tps, error, checked_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
 );
 const stmtCleanup = db.prepare(
   `DELETE FROM health_checks WHERE checked_at < (unixepoch('now') * 1000 - ${HEALTH_RETENTION_MS})`
@@ -58,6 +59,7 @@ interface HealthResult {
   status: number;
   latency_ms: number;
   ttft_ms: number | null;
+  tps: number | null;
   error: string | null;
 }
 
