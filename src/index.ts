@@ -25,7 +25,12 @@ if (PROXY_KEYS.size === 0) {
 
 const PORT = parseInt(process.env.PORT || "3000");
 const HEALTH_INTERVAL_MS = 60_000; // 1 minute
-const HEALTH_RETENTION_MS = 6 * 60 * 60 * 1000; // 6 hours
+const HEALTH_RETENTION_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+const HEALTH_CHART_BUCKETS = 168; // hourly buckets across the retention window
+const HEALTH_MODEL_IDS = new Set([
+  "accounts/fireworks/routers/glm-5-fast",
+  "accounts/fireworks/routers/kimi-k2p5-turbo",
+]);
 
 // ---------- database ----------
 
@@ -63,6 +68,90 @@ interface HealthResult {
   error: string | null;
 }
 
+function getHealthModels() {
+  return ALLOWED_MODELS.filter((m) => HEALTH_MODEL_IDS.has(m.id));
+}
+
+function estimateTokenCount(text: string): number {
+  const trimmed = text.trim();
+  if (!trimmed) return 0;
+  return Math.max(1, Math.ceil(trimmed.length / 4));
+}
+
+async function readHealthStreamMetrics(
+  body: ReadableStream<Uint8Array>,
+  start: number
+): Promise<{ ttft_ms: number | null; tps: number | null }> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let generatedText = "";
+  let completionTokens: number | null = null;
+  let ttft: number | null = null;
+
+  const processLine = (line: string) => {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("data:")) return;
+
+    const payload = trimmed.slice(5).trim();
+    if (!payload || payload === "[DONE]") return;
+
+    try {
+      const json = JSON.parse(payload);
+      if (typeof json?.usage?.completion_tokens === "number") {
+        completionTokens = json.usage.completion_tokens;
+      }
+
+      const choices = Array.isArray(json?.choices) ? json.choices : [];
+      for (const choice of choices) {
+        const delta = choice?.delta ?? {};
+        const parts = [
+          delta.content,
+          delta.reasoning_content,
+          choice?.text,
+        ];
+
+        for (const part of parts) {
+          if (typeof part === "string" && part.length > 0) {
+            if (ttft === null) ttft = Date.now() - start;
+            generatedText += part;
+          }
+        }
+      }
+    } catch {
+      // Ignore malformed stream lines; status and latency still get recorded.
+    }
+  };
+
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() ?? "";
+      for (const line of lines) processLine(line);
+    }
+
+    buffer += decoder.decode();
+    if (buffer.trim()) processLine(buffer);
+  } finally {
+    try { reader.releaseLock(); } catch {}
+  }
+
+  const tokens = completionTokens ?? estimateTokenCount(generatedText);
+  const elapsedMs = ttft === null
+    ? Date.now() - start
+    : Date.now() - start - ttft;
+  const tps = tokens > 0 && elapsedMs > 0
+    ? Math.round((tokens / (elapsedMs / 1000)) * 10) / 10
+    : null;
+
+  return { ttft_ms: ttft, tps };
+}
+
 async function runHealthCheck(model: string): Promise<HealthResult> {
   const start = Date.now();
   try {
@@ -74,21 +163,20 @@ async function runHealthCheck(model: string): Promise<HealthResult> {
       },
       body: JSON.stringify({
         model,
-        messages: [{ role: "user", content: "say hello" }],
+        messages: [{ role: "user", content: "Write one concise 30-word health check sentence." }],
         stream: true,
-        max_tokens: 5,
+        max_tokens: 48,
+        temperature: 0,
       }),
     });
 
     let ttft: number | null = null;
+    let tps: number | null = null;
 
     if (res.ok && res.body) {
-      // Read first chunk to measure time to first token
-      const reader = res.body.getReader();
-      const { value } = await reader.read();
-      if (value) ttft = Date.now() - start;
-      // Drain the rest
-      try { await reader.cancel(); } catch {}
+      const metrics = await readHealthStreamMetrics(res.body, start);
+      ttft = metrics.ttft_ms;
+      tps = metrics.tps;
     }
 
     const latency = Date.now() - start;
@@ -97,6 +185,7 @@ async function runHealthCheck(model: string): Promise<HealthResult> {
       status: res.status,
       latency_ms: latency,
       ttft_ms: ttft,
+      tps,
       error: res.ok ? null : await res.text().catch(() => "unknown error"),
     };
     return result;
@@ -106,24 +195,25 @@ async function runHealthCheck(model: string): Promise<HealthResult> {
       status: 0,
       latency_ms: Date.now() - start,
       ttft_ms: null,
+      tps: null,
       error: err.message || "fetch failed",
     };
   }
 }
 
 function recordCheck(result: HealthResult) {
-  stmtInsert.run(result.model, result.status, result.latency_ms, result.ttft_ms, result.error, Date.now());
+  stmtInsert.run(result.model, result.status, result.latency_ms, result.ttft_ms, result.tps, result.error, Date.now());
   // Periodically clean old records
   stmtCleanup.run();
 }
 
 async function runAllHealthChecks() {
-  const models = ALLOWED_MODELS.filter((m) => m.id !== "accounts/fireworks/routers/glm-5-fast");
+  const models = getHealthModels();
   for (const model of models) {
     const result = await runHealthCheck(model.id);
     recordCheck(result);
     const icon = result.status === 200 ? "✅" : "❌";
-    console.log(`  ${icon} ${model.id} — ${result.status} (${result.latency_ms}ms, ttft: ${result.ttft_ms ?? "n/a"}ms)`);
+    console.log(`  ${icon} ${model.id} — ${result.status} (${result.latency_ms}ms, ttft: ${result.ttft_ms ?? "n/a"}ms, tps: ${result.tps ?? "n/a"}/s)`);
   }
 }
 
@@ -343,126 +433,496 @@ async function proxyWithBody(req: Request): Promise<Response> {
 
 // ---------- health dashboard ----------
 
+type HistoryPoint = {
+  start: number;
+  end: number;
+  x: number;
+  count: number;
+  uptimePct: number | null;
+  avgLatency: number | null;
+  avgTtft: number | null;
+  avgTps: number | null;
+};
+
+type HistoryMetric = "avgLatency" | "avgTtft" | "avgTps";
+
+function escapeHtml(value: unknown): string {
+  return String(value ?? "").replace(/[&<>"']/g, (char) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;",
+  }[char] ?? char));
+}
+
+function numberOrNull(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function roundTo(value: number, decimals = 0): number {
+  const factor = 10 ** decimals;
+  return Math.round(value * factor) / factor;
+}
+
+function average(values: number[], decimals = 0): number | null {
+  if (values.length === 0) return null;
+  return roundTo(values.reduce((sum, value) => sum + value, 0) / values.length, decimals);
+}
+
+function percentile(values: number[], pct: number, decimals = 0): number | null {
+  if (values.length === 0) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  const index = Math.min(sorted.length - 1, Math.floor(sorted.length * pct));
+  return roundTo(sorted[index], decimals);
+}
+
+function formatMs(value: number | null | undefined): string {
+  return typeof value === "number" && Number.isFinite(value) ? `${Math.round(value)}ms` : "n/a";
+}
+
+function formatTps(value: number | null | undefined): string {
+  return typeof value === "number" && Number.isFinite(value) ? `${value.toFixed(1)}/s` : "n/a";
+}
+
+function formatPercent(value: number | null | undefined): string {
+  return typeof value === "number" && Number.isFinite(value) ? `${value.toFixed(1)}%` : "n/a";
+}
+
+function formatAgo(timestamp: number | null | undefined): string {
+  if (!timestamp) return "No checks yet";
+  const diff = Math.max(0, Date.now() - timestamp);
+  if (diff < 60_000) return `${Math.floor(diff / 1000)}s ago`;
+  if (diff < 60 * 60_000) return `${Math.floor(diff / 60_000)}m ago`;
+  if (diff < 24 * 60 * 60_000) return `${Math.floor(diff / (60 * 60_000))}h ago`;
+  return `${Math.floor(diff / (24 * 60 * 60_000))}d ago`;
+}
+
+function buildHistory(rows: any[]): HistoryPoint[] {
+  const now = Date.now();
+  const start = now - HEALTH_RETENTION_MS;
+  const bucketMs = Math.ceil(HEALTH_RETENTION_MS / HEALTH_CHART_BUCKETS);
+  const buckets = Array.from({ length: HEALTH_CHART_BUCKETS }, () => ({
+    total: 0,
+    up: 0,
+    latencies: [] as number[],
+    ttfts: [] as number[],
+    tpsValues: [] as number[],
+  }));
+
+  for (const row of rows) {
+    const checkedAt = numberOrNull(row.checked_at);
+    if (checkedAt === null || checkedAt < start || checkedAt > now) continue;
+
+    const index = Math.min(
+      HEALTH_CHART_BUCKETS - 1,
+      Math.max(0, Math.floor((checkedAt - start) / bucketMs))
+    );
+    const bucket = buckets[index];
+    bucket.total += 1;
+
+    if (row.status === 200) {
+      bucket.up += 1;
+      const latency = numberOrNull(row.latency_ms);
+      const ttft = numberOrNull(row.ttft_ms);
+      const tps = numberOrNull(row.tps);
+      if (latency !== null) bucket.latencies.push(latency);
+      if (ttft !== null) bucket.ttfts.push(ttft);
+      if (tps !== null) bucket.tpsValues.push(tps);
+    }
+  }
+
+  return buckets.map((bucket, index) => {
+    const bucketStart = start + index * bucketMs;
+    return {
+      start: bucketStart,
+      end: Math.min(now, bucketStart + bucketMs),
+      x: HEALTH_CHART_BUCKETS === 1 ? 0 : roundTo((index / (HEALTH_CHART_BUCKETS - 1)) * 100, 2),
+      count: bucket.total,
+      uptimePct: bucket.total > 0 ? roundTo((bucket.up / bucket.total) * 100, 1) : null,
+      avgLatency: average(bucket.latencies),
+      avgTtft: average(bucket.ttfts),
+      avgTps: average(bucket.tpsValues, 1),
+    };
+  });
+}
+
 function getStats(modelId: string) {
   const cutoff = Date.now() - HEALTH_RETENTION_MS;
   const rows = db.prepare(
-    "SELECT status, latency_ms, ttft_ms, error, checked_at FROM health_checks WHERE model = ? AND checked_at > ? ORDER BY checked_at ASC"
+    "SELECT status, latency_ms, ttft_ms, tps, error, checked_at FROM health_checks WHERE model = ? AND checked_at > ? ORDER BY checked_at ASC"
   ).all(modelId, cutoff) as any[];
 
   if (rows.length === 0) {
-    return { total: 0, up: 0, down: 0, uptimePct: 0, avgLatency: 0, avgTtft: 0, p50Latency: 0, p99Latency: 0, lastCheck: null, currentStatus: "unknown", checks: [] };
+    return {
+      total: 0,
+      up: 0,
+      down: 0,
+      uptimePct: 0,
+      avgLatency: null,
+      avgTtft: null,
+      avgTps: null,
+      p50Latency: null,
+      p99Latency: null,
+      p50Tps: null,
+      p99Tps: null,
+      lastCheck: null,
+      latestLatency: null,
+      latestTtft: null,
+      latestTps: null,
+      currentStatus: "unknown",
+      lastError: null,
+      history: buildHistory([]),
+    };
   }
 
-  const up = rows.filter((r: any) => r.status === 200).length;
+  const successfulRows = rows.filter((r: any) => r.status === 200);
+  const up = successfulRows.length;
   const down = rows.length - up;
-  const latencies = rows.filter((r: any) => r.status === 200).map((r: any) => r.latency_ms);
-  const ttfts = rows.filter((r: any) => r.ttft_ms != null).map((r: any) => r.ttft_ms);
-
-  const sorted = [...latencies].sort((a: number, b: number) => a - b);
-  const p50 = sorted.length ? sorted[Math.floor(sorted.length * 0.5)] : 0;
-  const p99 = sorted.length ? sorted[Math.floor(sorted.length * 0.99)] : 0;
+  const latencies = successfulRows.map((r: any) => numberOrNull(r.latency_ms)).filter((v): v is number => v !== null);
+  const ttfts = successfulRows.map((r: any) => numberOrNull(r.ttft_ms)).filter((v): v is number => v !== null);
+  const tpsValues = successfulRows.map((r: any) => numberOrNull(r.tps)).filter((v): v is number => v !== null);
+  const last = rows[rows.length - 1];
+  let lastError: string | null = null;
+  for (let i = rows.length - 1; i >= 0; i--) {
+    if (rows[i].error) {
+      lastError = String(rows[i].error);
+      break;
+    }
+  }
 
   return {
     total: rows.length,
     up,
     down,
-    uptimePct: Math.round((up / rows.length) * 1000) / 10,
-    avgLatency: latencies.length ? Math.round(latencies.reduce((a: number, b: number) => a + b, 0) / latencies.length) : 0,
-    avgTtft: ttfts.length ? Math.round(ttfts.reduce((a: number, b: number) => a + b, 0) / ttfts.length) : 0,
-    p50Latency: p50,
-    p99Latency: p99,
-    lastCheck: rows[rows.length - 1].checked_at,
-    currentStatus: rows[rows.length - 1].status === 200 ? "up" : "down",
-    checks: rows.map((r: any) => ({
-      status: r.status,
-      latency_ms: r.latency_ms,
-      ttft_ms: r.ttft_ms,
-      error: r.error,
-      checked_at: r.checked_at,
-    })),
+    uptimePct: roundTo((up / rows.length) * 100, 1),
+    avgLatency: average(latencies),
+    avgTtft: average(ttfts),
+    avgTps: average(tpsValues, 1),
+    p50Latency: percentile(latencies, 0.5),
+    p99Latency: percentile(latencies, 0.99),
+    p50Tps: percentile(tpsValues, 0.5, 1),
+    p99Tps: percentile(tpsValues, 0.99, 1),
+    lastCheck: last.checked_at,
+    latestLatency: numberOrNull(last.latency_ms),
+    latestTtft: numberOrNull(last.ttft_ms),
+    latestTps: numberOrNull(last.tps),
+    currentStatus: last.status === 200 ? "up" : "down",
+    lastError,
+    history: buildHistory(rows),
   };
 }
 
+function historyValues(history: HistoryPoint[], key: HistoryMetric): number[] {
+  return history.map((point) => point[key]).filter((value): value is number => value !== null);
+}
+
+function chartPath(history: HistoryPoint[], key: HistoryMetric, maxValue: number): string {
+  const points = history
+    .filter((point) => typeof point[key] === "number")
+    .map((point) => {
+      const value = point[key] as number;
+      const y = roundTo(34 - Math.min(value / maxValue, 1) * 28, 2);
+      return `${point.x.toFixed(2)} ${y.toFixed(2)}`;
+    });
+
+  if (points.length === 0) return "";
+  if (points.length === 1) return `M ${points[0]} L ${points[0]}`;
+  return points.map((point, index) => `${index === 0 ? "M" : "L"} ${point}`).join(" ");
+}
+
+function renderUptimeTimeline(history: HistoryPoint[]): string {
+  return `
+    <div class="status-strip" aria-label="Hourly status history">
+      ${history.map((point) => {
+        const cls = point.count === 0
+          ? "bucket-empty"
+          : (point.uptimePct ?? 0) >= 99.9
+            ? "bucket-ok"
+            : (point.uptimePct ?? 0) > 0
+              ? "bucket-mixed"
+              : "bucket-down";
+        const title = point.count === 0
+          ? `${new Date(point.start).toLocaleString()} - no data`
+          : `${new Date(point.start).toLocaleString()} - ${formatPercent(point.uptimePct)} uptime, ${point.count} checks`;
+        return `<span class="history-bucket ${cls}" title="${escapeHtml(title)}"></span>`;
+      }).join("")}
+    </div>`;
+}
+
+function renderLineChart(
+  title: string,
+  detail: string,
+  history: HistoryPoint[],
+  series: { key: HistoryMetric; label: string; className: string }[],
+  unit: "ms" | "tps"
+): string {
+  const values = series.flatMap((item) => historyValues(history, item.key));
+  const observedMax = values.length > 0 ? Math.max(...values) : null;
+  const maxValue = Math.max(observedMax ?? 0, unit === "ms" ? 100 : 1);
+  const maxLabel = unit === "ms" ? formatMs(observedMax) : formatTps(observedMax);
+  const hasData = values.length > 0;
+
+  return `
+    <section class="chart-block">
+      <div class="chart-heading">
+        <div>
+          <h3>${escapeHtml(title)}</h3>
+          <p>${escapeHtml(detail)}</p>
+        </div>
+        <span>${escapeHtml(maxLabel)} peak</span>
+      </div>
+      ${hasData ? `
+        <svg class="chart-canvas" viewBox="0 0 100 36" preserveAspectRatio="none" role="img" aria-label="${escapeHtml(title)} chart">
+          <path class="chart-grid" d="M 0 6 H 100 M 0 18 H 100 M 0 30 H 100"></path>
+          ${series.map((item) => `<path class="chart-line ${item.className}" d="${chartPath(history, item.key, maxValue)}"></path>`).join("")}
+        </svg>
+        <div class="legend">
+          ${series.map((item) => `<span><i class="${item.className}"></i>${escapeHtml(item.label)}</span>`).join("")}
+        </div>` : `
+        <div class="chart-empty">Waiting for enough health checks</div>`}
+    </section>`;
+}
+
+function renderMetric(label: string, value: string, detail: string, tone = ""): string {
+  return `
+    <div class="metric ${tone}">
+      <span>${escapeHtml(label)}</span>
+      <strong>${escapeHtml(value)}</strong>
+      <small>${escapeHtml(detail)}</small>
+    </div>`;
+}
+
+function renderModelPanel(model: any): string {
+  const s = model.stats;
+  const latencyChart = renderLineChart(
+    "Latency and TTFT",
+    "Hourly averages over the current 7-day window.",
+    s.history,
+    [
+      { key: "avgLatency", label: "Latency", className: "line-latency" },
+      { key: "avgTtft", label: "TTFT", className: "line-ttft" },
+    ],
+    "ms"
+  );
+  const tpsChart = renderLineChart(
+    "Throughput",
+    "Estimated output tokens per second from health prompts.",
+    s.history,
+    [{ key: "avgTps", label: "TPS", className: "line-tps" }],
+    "tps"
+  );
+  const statusLabel = s.currentStatus === "up" ? "Up" : s.currentStatus === "down" ? "Down" : "Unknown";
+  const statusMeta = s.lastCheck ? `Last check ${formatAgo(s.lastCheck)}` : "Waiting for first check";
+  const uptimeTone = s.currentStatus === "up" ? "metric-good" : s.currentStatus === "down" ? "metric-bad" : "";
+  const errorText = s.lastError ?? "None in the current window";
+
+  return `
+    <article class="model-panel status-${s.currentStatus}">
+      <div class="model-header">
+        <div class="model-heading">
+          <span class="status-dot" aria-hidden="true"></span>
+          <div>
+            <h2>${escapeHtml(model.name)}</h2>
+            <p class="model-id">${escapeHtml(model.id)}</p>
+            <div class="model-meta">
+              <span class="chip">${Math.round(model.contextWindow / 1000)}k context</span>
+              <span class="chip">${escapeHtml(model.input.join(" + "))}</span>
+              <span class="chip">60s cadence</span>
+            </div>
+          </div>
+        </div>
+        <div class="status-summary">
+          <span class="badge badge-${s.currentStatus}">${escapeHtml(statusLabel)}</span>
+          <small>${escapeHtml(statusMeta)}</small>
+        </div>
+      </div>
+
+      <div class="metrics">
+        ${renderMetric("Uptime", formatPercent(s.uptimePct), `${s.up}/${s.total} checks succeeded`, uptimeTone)}
+        ${renderMetric("Avg latency", formatMs(s.avgLatency), `p50 ${formatMs(s.p50Latency)} / p99 ${formatMs(s.p99Latency)}`)}
+        ${renderMetric("Avg TTFT", formatMs(s.avgTtft), `latest ${formatMs(s.latestTtft)}`)}
+        ${renderMetric("Avg TPS", formatTps(s.avgTps), `p50 ${formatTps(s.p50Tps)} / p99 ${formatTps(s.p99Tps)}`, s.avgTps !== null ? "metric-good" : "")}
+        ${renderMetric("Failures", String(s.down), `latest latency ${formatMs(s.latestLatency)}`, s.down > 0 ? "metric-bad" : "")}
+      </div>
+
+      <div class="history-row">
+        <div class="section-heading">
+          <div>
+            <h3>7-day status history</h3>
+            <p>Hourly buckets, retained for the last seven days.</p>
+          </div>
+          <span>${s.history.filter((point: HistoryPoint) => point.count > 0).length}/${HEALTH_CHART_BUCKETS} buckets</span>
+        </div>
+        ${renderUptimeTimeline(s.history)}
+      </div>
+
+      <div class="charts">
+        ${latencyChart}
+        ${tpsChart}
+      </div>
+
+      <p class="error-note ${s.lastError ? "" : "ok-note"}"><span>Latest error</span>${escapeHtml(errorText)}</p>
+    </article>`;
+}
+
 function renderHealthPage(): Response {
-  const models = ALLOWED_MODELS.filter((m) => m.id !== "accounts/fireworks/routers/glm-5-fast");
+  const models = getHealthModels();
   const stats = models.map((m) => ({ ...m, stats: getStats(m.id) }));
+  const totalChecks = stats.reduce((sum: number, model: any) => sum + model.stats.total, 0);
+  const successfulChecks = stats.reduce((sum: number, model: any) => sum + model.stats.up, 0);
+  const modelsUp = stats.filter((model: any) => model.stats.currentStatus === "up").length;
+  const fleetUptime = totalChecks > 0 ? roundTo((successfulChecks / totalChecks) * 100, 1) : 0;
+  const fleetTpsValues = stats.map((model: any) => model.stats.avgTps).filter((value): value is number => value !== null);
+  const modelPanels = stats.map(renderModelPanel).join("");
 
   const html = `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Fireworks Proxy — Status</title>
+<title>Fireworks Proxy - Status</title>
 <style>
-  :root { --bg: #0d1117; --card: #161b22; --border: #30363d; --text: #e6edf3; --muted: #8b949e; --green: #3fb950; --red: #f85149; --yellow: #d29922; --blue: #58a6ff; }
+  :root {
+    color-scheme: dark;
+    --bg: #0b0b0a;
+    --panel: #151513;
+    --panel-soft: #1b1a17;
+    --border: #2b2924;
+    --border-strong: #3a362f;
+    --text: #f4f0e8;
+    --muted: #a8a096;
+    --faint: #746f66;
+    --green: #7bd88f;
+    --green-dim: #203226;
+    --red: #ff6f61;
+    --red-dim: #3a201d;
+    --amber: #d6a84f;
+    --amber-dim: #342a16;
+    --empty: #24231f;
+  }
   * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); padding: 24px; min-height: 100vh; }
-  h1 { font-size: 1.5rem; margin-bottom: 4px; }
-  .subtitle { color: var(--muted); margin-bottom: 24px; font-size: 0.85rem; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); gap: 16px; margin-bottom: 24px; }
-  .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 20px; }
-  .card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
-  .model-name { font-weight: 600; font-size: 1rem; }
-  .badge { padding: 3px 10px; border-radius: 999px; font-size: 0.75rem; font-weight: 600; }
-  .badge-up { background: rgba(63,185,80,0.15); color: var(--green); }
-  .badge-down { background: rgba(248,81,73,0.15); color: var(--red); }
-  .badge-unknown { background: rgba(139,148,158,0.15); color: var(--muted); }
-  .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 16px; }
-  .stat { text-align: center; }
-  .stat-value { font-size: 1.3rem; font-weight: 700; }
-  .stat-label { font-size: 0.7rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
-  .stat-green { color: var(--green); }
-  .stat-red { color: var(--red); }
-  .stat-blue { color: var(--blue); }
-  .timeline { display: flex; gap: 2px; height: 32px; align-items: flex-end; border-radius: 4px; overflow: hidden; }
-  .tick { flex: 1; min-width: 3px; border-radius: 2px 2px 0 0; transition: opacity 0.15s; }
-  .tick:hover { opacity: 0.7; }
-  .tick-ok { background: var(--green); }
-  .tick-err { background: var(--red); }
-  .tick-title { font-size: 0.65rem; color: var(--muted); text-align: center; margin-top: 4px; }
-  .uptime-bar { height: 6px; background: var(--border); border-radius: 3px; margin-bottom: 16px; overflow: hidden; }
-  .uptime-fill { height: 100%; border-radius: 3px; background: var(--green); transition: width 0.3s; }
-  .footer { text-align: center; color: var(--muted); font-size: 0.75rem; margin-top: 32px; }
+  body {
+    min-height: 100vh;
+    background:
+      radial-gradient(circle at 18% 0%, rgba(123, 216, 143, 0.07), transparent 28rem),
+      linear-gradient(180deg, #10100e 0%, var(--bg) 34rem);
+    color: var(--text);
+    font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    font-variant-numeric: tabular-nums;
+  }
+  .shell { max-width: 1280px; margin: 0 auto; padding: 32px 24px 44px; }
+  .topbar { display: flex; justify-content: space-between; gap: 24px; align-items: flex-start; padding-bottom: 24px; border-bottom: 1px solid var(--border); }
+  .eyebrow { color: var(--muted); font-size: 0.78rem; margin-bottom: 8px; }
+  h1 { font-size: 2rem; line-height: 1.1; font-weight: 720; letter-spacing: 0; }
+  .subtitle { color: var(--muted); margin-top: 10px; max-width: 760px; line-height: 1.5; font-size: 0.96rem; }
+  .refresh { color: var(--muted); text-align: right; min-width: 220px; font-size: 0.82rem; line-height: 1.45; }
+  .refresh strong { display: block; color: var(--text); margin-top: 6px; font-size: 0.9rem; font-weight: 650; }
+  .overview { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px; margin: 24px 0; background: var(--border); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .overview-item { background: rgba(21, 21, 19, 0.94); padding: 18px; min-width: 0; }
+  .overview-item span { display: block; color: var(--muted); font-size: 0.78rem; margin-bottom: 10px; }
+  .overview-item strong { display: block; color: var(--text); font-size: 1.55rem; line-height: 1.05; }
+  .overview-item small { display: block; color: var(--faint); margin-top: 9px; line-height: 1.35; }
+  .model-stack { display: grid; gap: 20px; }
+  .model-panel { background: rgba(21, 21, 19, 0.96); border: 1px solid var(--border); border-radius: 8px; padding: 24px; }
+  .model-panel.status-up { border-color: rgba(123, 216, 143, 0.34); }
+  .model-panel.status-down { border-color: rgba(255, 111, 97, 0.44); }
+  .model-header { display: flex; justify-content: space-between; gap: 24px; padding-bottom: 20px; border-bottom: 1px solid var(--border); }
+  .model-heading { display: flex; gap: 12px; min-width: 0; }
+  .status-dot { width: 10px; height: 10px; border-radius: 5px; margin-top: 9px; flex: 0 0 auto; background: var(--faint); box-shadow: 0 0 0 4px rgba(116, 111, 102, 0.16); }
+  .status-up .status-dot { background: var(--green); box-shadow: 0 0 0 4px rgba(123, 216, 143, 0.13); }
+  .status-down .status-dot { background: var(--red); box-shadow: 0 0 0 4px rgba(255, 111, 97, 0.14); }
+  h2 { font-size: 1.28rem; line-height: 1.2; letter-spacing: 0; }
+  .model-id { color: var(--muted); margin-top: 7px; font-size: 0.82rem; overflow-wrap: anywhere; }
+  .model-meta { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 13px; }
+  .chip { border: 1px solid var(--border); background: var(--panel-soft); color: var(--muted); border-radius: 6px; padding: 4px 7px; font-size: 0.78rem; }
+  .status-summary { text-align: right; flex: 0 0 auto; }
+  .badge { display: inline-flex; align-items: center; border: 1px solid var(--border-strong); border-radius: 6px; padding: 6px 10px; font-size: 0.8rem; font-weight: 700; background: var(--panel-soft); }
+  .badge-up { color: var(--green); border-color: rgba(123, 216, 143, 0.38); background: var(--green-dim); }
+  .badge-down { color: var(--red); border-color: rgba(255, 111, 97, 0.42); background: var(--red-dim); }
+  .badge-unknown { color: var(--muted); }
+  .status-summary small { display: block; color: var(--muted); margin-top: 8px; font-size: 0.78rem; }
+  .metrics { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); border-bottom: 1px solid var(--border); }
+  .metric { min-width: 0; padding: 18px 16px 18px 0; border-right: 1px solid var(--border); }
+  .metric:last-child { border-right: 0; padding-right: 0; }
+  .metric span { display: block; color: var(--muted); font-size: 0.78rem; margin-bottom: 8px; }
+  .metric strong { display: block; color: var(--text); font-size: 1.42rem; line-height: 1.08; font-weight: 720; overflow-wrap: anywhere; }
+  .metric small { display: block; color: var(--faint); margin-top: 8px; line-height: 1.35; font-size: 0.78rem; }
+  .metric-good strong { color: var(--green); }
+  .metric-bad strong { color: var(--red); }
+  .history-row { padding: 20px 0; border-bottom: 1px solid var(--border); }
+  .section-heading, .chart-heading { display: flex; justify-content: space-between; gap: 18px; align-items: flex-start; }
+  .section-heading h3, .chart-heading h3 { font-size: 0.98rem; line-height: 1.2; letter-spacing: 0; }
+  .section-heading p, .chart-heading p { color: var(--muted); margin-top: 6px; line-height: 1.45; font-size: 0.82rem; }
+  .section-heading span, .chart-heading span { color: var(--faint); font-size: 0.78rem; white-space: nowrap; }
+  .status-strip { display: grid; grid-template-columns: repeat(168, minmax(2px, 1fr)); gap: 2px; height: 34px; margin-top: 15px; }
+  .history-bucket { border-radius: 2px; min-width: 2px; transition: opacity 0.15s ease; }
+  .history-bucket:hover { opacity: 0.7; }
+  .bucket-empty { background: var(--empty); }
+  .bucket-ok { background: var(--green); }
+  .bucket-mixed { background: var(--amber); }
+  .bucket-down { background: var(--red); }
+  .charts { display: grid; grid-template-columns: 1.25fr 0.85fr; gap: 28px; padding-top: 22px; }
+  .chart-block { min-width: 0; }
+  .chart-canvas, .chart-empty { width: 100%; height: 172px; margin-top: 14px; border: 1px solid var(--border); border-radius: 8px; background: linear-gradient(180deg, rgba(244, 240, 232, 0.025), rgba(244, 240, 232, 0.008)); }
+  .chart-empty { display: grid; place-items: center; color: var(--muted); font-size: 0.86rem; }
+  .chart-grid { stroke: var(--border-strong); stroke-width: 0.35; fill: none; vector-effect: non-scaling-stroke; }
+  .chart-line { fill: none; stroke-width: 1.45; stroke-linecap: round; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
+  .line-latency { stroke: var(--text); }
+  .line-ttft { stroke: var(--amber); }
+  .line-tps { stroke: var(--green); }
+  .legend { display: flex; flex-wrap: wrap; gap: 12px; color: var(--muted); margin-top: 10px; font-size: 0.78rem; }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .legend i { width: 8px; height: 8px; border-radius: 4px; display: inline-block; }
+  .legend .line-latency { background: var(--text); }
+  .legend .line-ttft { background: var(--amber); }
+  .legend .line-tps { background: var(--green); }
+  .error-note { margin-top: 20px; padding-top: 18px; border-top: 1px solid var(--border); color: var(--red); font-size: 0.84rem; line-height: 1.45; overflow-wrap: anywhere; }
+  .error-note span { color: var(--muted); margin-right: 8px; }
+  .ok-note { color: var(--muted); }
+  .footer { text-align: center; color: var(--faint); font-size: 0.78rem; margin-top: 32px; }
+  @media (max-width: 980px) {
+    .topbar, .model-header, .section-heading, .chart-heading { flex-direction: column; }
+    .refresh, .status-summary { text-align: left; min-width: 0; }
+    .overview { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .metric { border-right: 0; border-bottom: 1px solid var(--border); padding-right: 0; }
+    .metric:last-child { border-bottom: 0; }
+    .charts { grid-template-columns: 1fr; }
+  }
+  @media (max-width: 620px) {
+    .shell { padding: 24px 14px 34px; }
+    h1 { font-size: 1.58rem; }
+    .overview { grid-template-columns: 1fr; }
+    .metrics { grid-template-columns: 1fr; }
+    .status-strip { gap: 1px; }
+  }
 </style>
 </head>
 <body>
-<h1>🔥 Fireworks Proxy</h1>
-<p class="subtitle">Model health monitor — checking every 60s, 6h history</p>
-<div class="grid">
-${stats.map((m: any) => {
-  const s = m.stats;
-  const barWidth = s.total > 0 ? s.uptimePct : 0;
-  const maxLat = Math.max(...s.checks.map((c: any) => c.latency_ms), 1);
-  return `
-  <div class="card">
-    <div class="card-header">
-      <span class="model-name">${m.name}</span>
-      <span class="badge badge-${s.currentStatus}">${s.currentStatus === "up" ? "● UP" : s.currentStatus === "down" ? "● DOWN" : "○ UNKNOWN"}</span>
+<main class="shell">
+  <header class="topbar">
+    <div>
+      <p class="eyebrow">Fireworks Proxy</p>
+      <h1>Model health</h1>
+      <p class="subtitle">Tracking GLM 5 and Kimi K2.5 every 60 seconds. Metrics cover the last 7 days and are grouped into hourly buckets.</p>
     </div>
-    <div class="uptime-bar"><div class="uptime-fill" style="width:${barWidth}%"></div></div>
-    <div class="stats">
-      <div class="stat"><div class="stat-value stat-green">${s.uptimePct}%</div><div class="stat-label">Uptime</div></div>
-      <div class="stat"><div class="stat-value stat-blue">${s.avgLatency}ms</div><div class="stat-label">Avg Latency</div></div>
-      <div class="stat"><div class="stat-value stat-blue">${s.avgTtft}ms</div><div class="stat-label">Avg TTFT</div></div>
-    </div>
-    <div class="stats">
-      <div class="stat"><div class="stat-value">${s.p50Latency}ms</div><div class="stat-label">p50 Latency</div></div>
-      <div class="stat"><div class="stat-value">${s.p99Latency}ms</div><div class="stat-label">p99 Latency</div></div>
-      <div class="stat"><div class="stat-value">${s.up}/${s.total}</div><div class="stat-label">Checks OK</div></div>
-    </div>
-    <div class="timeline">
-      ${s.checks.map((c: any) => {
-        const h = Math.max(4, Math.round((c.latency_ms / maxLat) * 32));
-        const cls = c.status === 200 ? "tick-ok" : "tick-err";
-        const time = new Date(c.checked_at).toLocaleTimeString();
-        return `<div class="tick ${cls}" style="height:${h}px" title="${time} — ${c.status} (${c.latency_ms}ms, ttft: ${c.ttft_ms ?? 'n/a'}ms)"></div>`;
-      }).join("")}
-    </div>
-    <div class="tick-title">last 6h (${s.checks.length} checks)</div>
-  </div>`;
-}).join("")}
-</div>
-<div class="footer">Last refresh: ${new Date().toLocaleString()} · Auto-refreshes every 60s</div>
+    <div class="refresh">Auto-refreshes every 60 seconds<strong>${new Date().toLocaleString()}</strong></div>
+  </header>
+
+  <section class="overview" aria-label="Fleet overview">
+    <div class="overview-item"><span>Models up</span><strong>${modelsUp}/${stats.length}</strong><small>Current status from the latest check per model</small></div>
+    <div class="overview-item"><span>Fleet uptime</span><strong>${formatPercent(fleetUptime)}</strong><small>${successfulChecks}/${totalChecks} successful checks</small></div>
+    <div class="overview-item"><span>Avg TPS</span><strong>${formatTps(fleetTpsValues.length ? average(fleetTpsValues, 1) : null)}</strong><small>Estimated from streamed health prompts</small></div>
+    <div class="overview-item"><span>Retention</span><strong>7 days</strong><small>${HEALTH_CHART_BUCKETS} hourly buckets per model</small></div>
+  </section>
+
+  <section class="model-stack" aria-label="Model status">
+    ${modelPanels}
+  </section>
+
+  <div class="footer">Window starts ${new Date(Date.now() - HEALTH_RETENTION_MS).toLocaleString()} - page refreshed ${new Date().toLocaleString()}</div>
+</main>
 <script>setTimeout(() => location.reload(), 60000);</script>
 </body>
 </html>`;
