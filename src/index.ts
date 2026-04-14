@@ -25,8 +25,33 @@ if (PROXY_KEYS.size === 0) {
 
 const PORT = parseInt(process.env.PORT || "3000");
 const HEALTH_INTERVAL_MS = 60_000; // 1 minute
-const HEALTH_RETENTION_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
-const HEALTH_CHART_BUCKETS = 168; // hourly buckets across the retention window
+const HEALTH_RETENTION_MS = 7 * 24 * 60 * 60 * 1000; // 7 days (max retention)
+const DEFAULT_TIME_RANGE_MS = 30 * 60 * 1000; // 30 minutes default view
+
+// Time range presets: label -> milliseconds
+const TIME_RANGES: Record<string, number> = {
+  "30m": 30 * 60 * 1000,
+  "1h": 60 * 60 * 1000,
+  "6h": 6 * 60 * 60 * 1000,
+  "24h": 24 * 60 * 60 * 1000,
+  "3d": 3 * 24 * 60 * 60 * 1000,
+  "7d": 7 * 24 * 60 * 60 * 1000,
+};
+
+function parseTimeRange(param: string | null): number {
+  if (!param || !TIME_RANGES[param]) return DEFAULT_TIME_RANGE_MS;
+  return TIME_RANGES[param];
+}
+
+function getChartBuckets(rangeMs: number): number {
+  // Scale buckets: fewer for shorter ranges, capped at 168 for 7 days
+  if (rangeMs <= 30 * 60 * 1000) return 30;      // 30min -> 30 buckets (1min each)
+  if (rangeMs <= 60 * 60 * 1000) return 60;     // 1h -> 60 buckets (1min each)
+  if (rangeMs <= 6 * 60 * 60 * 1000) return 72;  // 6h -> 72 buckets (5min each)
+  if (rangeMs <= 24 * 60 * 60 * 1000) return 96; // 24h -> 96 buckets (15min each)
+  if (rangeMs <= 3 * 24 * 60 * 60 * 1000) return 72; // 3d -> 72 buckets (1h each)
+  return 168; // 7d -> 168 buckets (1h each)
+}
 const HEALTH_MODEL_IDS = new Set([
   "accounts/fireworks/routers/glm-5-fast",
   "accounts/fireworks/routers/kimi-k2p5-turbo",
@@ -498,11 +523,12 @@ function formatAgo(timestamp: number | null | undefined): string {
   return `${Math.floor(diff / (24 * 60 * 60_000))}d ago`;
 }
 
-function buildHistory(rows: any[]): HistoryPoint[] {
+function buildHistory(rows: any[], rangeMs: number): HistoryPoint[] {
   const now = Date.now();
-  const start = now - HEALTH_RETENTION_MS;
-  const bucketMs = Math.ceil(HEALTH_RETENTION_MS / HEALTH_CHART_BUCKETS);
-  const buckets = Array.from({ length: HEALTH_CHART_BUCKETS }, () => ({
+  const start = now - rangeMs;
+  const numBuckets = getChartBuckets(rangeMs);
+  const bucketMs = Math.ceil(rangeMs / numBuckets);
+  const buckets = Array.from({ length: numBuckets }, () => ({
     total: 0,
     up: 0,
     latencies: [] as number[],
@@ -515,7 +541,7 @@ function buildHistory(rows: any[]): HistoryPoint[] {
     if (checkedAt === null || checkedAt < start || checkedAt > now) continue;
 
     const index = Math.min(
-      HEALTH_CHART_BUCKETS - 1,
+      numBuckets - 1,
       Math.max(0, Math.floor((checkedAt - start) / bucketMs))
     );
     const bucket = buckets[index];
@@ -537,7 +563,7 @@ function buildHistory(rows: any[]): HistoryPoint[] {
     return {
       start: bucketStart,
       end: Math.min(now, bucketStart + bucketMs),
-      x: HEALTH_CHART_BUCKETS === 1 ? 0 : roundTo((index / (HEALTH_CHART_BUCKETS - 1)) * 100, 2),
+      x: numBuckets === 1 ? 0 : roundTo((index / (numBuckets - 1)) * 100, 2),
       count: bucket.total,
       uptimePct: bucket.total > 0 ? roundTo((bucket.up / bucket.total) * 100, 1) : null,
       avgLatency: average(bucket.latencies),
@@ -547,8 +573,8 @@ function buildHistory(rows: any[]): HistoryPoint[] {
   });
 }
 
-function getStats(modelId: string) {
-  const cutoff = Date.now() - HEALTH_RETENTION_MS;
+function getStats(modelId: string, rangeMs: number) {
+  const cutoff = Date.now() - rangeMs;
   const rows = db.prepare(
     "SELECT status, latency_ms, ttft_ms, tps, error, checked_at FROM health_checks WHERE model = ? AND checked_at > ? ORDER BY checked_at ASC"
   ).all(modelId, cutoff) as any[];
@@ -572,7 +598,7 @@ function getStats(modelId: string) {
       latestTps: null,
       currentStatus: "unknown",
       lastError: null,
-      history: buildHistory([]),
+      history: buildHistory(rows, rangeMs),
     };
   }
 
@@ -609,7 +635,7 @@ function getStats(modelId: string) {
     latestTps: numberOrNull(last.tps),
     currentStatus: last.status === 200 ? "up" : "down",
     lastError,
-    history: buildHistory(rows),
+    history: buildHistory(rows, rangeMs),
   };
 }
 
@@ -631,9 +657,10 @@ function chartPath(history: HistoryPoint[], key: HistoryMetric, maxValue: number
   return points.map((point, index) => `${index === 0 ? "M" : "L"} ${point}`).join(" ");
 }
 
-function renderUptimeTimeline(history: HistoryPoint[]): string {
+function renderUptimeTimeline(history: HistoryPoint[], numBuckets: number): string {
+  const gridCols = `repeat(${numBuckets}, minmax(2px, 1fr))`;
   return `
-    <div class="status-strip" aria-label="Hourly status history">
+    <div class="status-strip" style="grid-template-columns: ${gridCols}" aria-label="Status history">
       ${history.map((point) => {
         const cls = point.count === 0
           ? "bucket-empty"
@@ -693,11 +720,31 @@ function renderMetric(label: string, value: string, detail: string, tone = ""): 
     </div>`;
 }
 
-function renderModelPanel(model: any): string {
+function formatRangeLabel(rangeMs: number): string {
+  if (rangeMs <= 30 * 60 * 1000) return "30 minutes";
+  if (rangeMs <= 60 * 60 * 1000) return "1 hour";
+  if (rangeMs <= 6 * 60 * 60 * 1000) return "6 hours";
+  if (rangeMs <= 24 * 60 * 60 * 1000) return "24 hours";
+  if (rangeMs <= 3 * 24 * 60 * 60 * 1000) return "3 days";
+  return "7 days";
+}
+
+function getBucketLabel(rangeMs: number): string {
+  if (rangeMs <= 30 * 60 * 1000) return "1-minute buckets";
+  if (rangeMs <= 60 * 60 * 1000) return "1-minute buckets";
+  if (rangeMs <= 6 * 60 * 60 * 1000) return "5-minute buckets";
+  if (rangeMs <= 24 * 60 * 60 * 1000) return "15-minute buckets";
+  if (rangeMs <= 3 * 24 * 60 * 60 * 1000) return "1-hour buckets";
+  return "1-hour buckets";
+}
+
+function renderModelPanel(model: any, rangeMs: number, numBuckets: number): string {
   const s = model.stats;
+  const rangeLabel = formatRangeLabel(rangeMs);
+  const bucketLabel = getBucketLabel(rangeMs);
   const latencyChart = renderLineChart(
-    "Latency and TTFT",
-    "Hourly averages over the current 7-day window.",
+    "Latency & TTFT",
+    `Averages over the last ${rangeLabel}.`,
     s.history,
     [
       { key: "avgLatency", label: "Latency", className: "line-latency" },
@@ -707,7 +754,7 @@ function renderModelPanel(model: any): string {
   );
   const tpsChart = renderLineChart(
     "Throughput",
-    "Estimated output tokens per second from health prompts.",
+    "Tokens per second from health prompts.",
     s.history,
     [{ key: "avgTps", label: "TPS", className: "line-tps" }],
     "tps"
@@ -715,7 +762,7 @@ function renderModelPanel(model: any): string {
   const statusLabel = s.currentStatus === "up" ? "Up" : s.currentStatus === "down" ? "Down" : "Unknown";
   const statusMeta = s.lastCheck ? `Last check ${formatAgo(s.lastCheck)}` : "Waiting for first check";
   const uptimeTone = s.currentStatus === "up" ? "metric-good" : s.currentStatus === "down" ? "metric-bad" : "";
-  const errorText = s.lastError ?? "None in the current window";
+  const errorText = s.lastError ?? "None in current window";
 
   return `
     <article class="model-panel status-${s.currentStatus}">
@@ -749,12 +796,12 @@ function renderModelPanel(model: any): string {
       <div class="history-row">
         <div class="section-heading">
           <div>
-            <h3>7-day status history</h3>
-            <p>Hourly buckets, retained for the last seven days.</p>
+            <h3>Status history</h3>
+            <p>${rangeLabel} window with ${bucketLabel}.</p>
           </div>
-          <span>${s.history.filter((point: HistoryPoint) => point.count > 0).length}/${HEALTH_CHART_BUCKETS} buckets</span>
+          <span>${s.history.filter((point: HistoryPoint) => point.count > 0).length}/${numBuckets} buckets</span>
         </div>
-        ${renderUptimeTimeline(s.history)}
+        ${renderUptimeTimeline(s.history, numBuckets)}
       </div>
 
       <div class="charts">
@@ -766,15 +813,24 @@ function renderModelPanel(model: any): string {
     </article>`;
 }
 
-function renderHealthPage(): Response {
+function renderHealthPage(rangeParam: string | null): Response {
+  const rangeMs = parseTimeRange(rangeParam);
+  const numBuckets = getChartBuckets(rangeMs);
+  const rangeLabel = formatRangeLabel(rangeMs);
   const models = getHealthModels();
-  const stats = models.map((m) => ({ ...m, stats: getStats(m.id) }));
+  const stats = models.map((m) => ({ ...m, stats: getStats(m.id, rangeMs) }));
   const totalChecks = stats.reduce((sum: number, model: any) => sum + model.stats.total, 0);
   const successfulChecks = stats.reduce((sum: number, model: any) => sum + model.stats.up, 0);
   const modelsUp = stats.filter((model: any) => model.stats.currentStatus === "up").length;
   const fleetUptime = totalChecks > 0 ? roundTo((successfulChecks / totalChecks) * 100, 1) : 0;
   const fleetTpsValues = stats.map((model: any) => model.stats.avgTps).filter((value): value is number => value !== null);
-  const modelPanels = stats.map(renderModelPanel).join("");
+  const modelPanels = stats.map((m) => renderModelPanel(m, rangeMs, numBuckets)).join("");
+
+  // Build time range selector options
+  const rangeOptions = Object.keys(TIME_RANGES).map((key) => {
+    const selected = key === (rangeParam || "30m") ? " selected" : "";
+    return `<option value="${key}"${selected}>${key}</option>`;
+  }).join("");
 
   const html = `<!DOCTYPE html>
 <html lang="en">
@@ -811,23 +867,25 @@ function renderHealthPage(): Response {
     font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     font-variant-numeric: tabular-nums;
   }
-  .shell { max-width: 1280px; margin: 0 auto; padding: 32px 24px 44px; }
-  .topbar { display: flex; justify-content: space-between; gap: 24px; align-items: flex-start; padding-bottom: 24px; border-bottom: 1px solid var(--border); }
+  .shell { max-width: 1400px; margin: 0 auto; padding: 20px 20px 32px; }
+  .topbar { display: flex; justify-content: space-between; gap: 20px; align-items: flex-start; padding-bottom: 16px; border-bottom: 1px solid var(--border); }
   .eyebrow { color: var(--muted); font-size: 0.78rem; margin-bottom: 8px; }
   h1 { font-size: 2rem; line-height: 1.1; font-weight: 720; letter-spacing: 0; }
   .subtitle { color: var(--muted); margin-top: 10px; max-width: 760px; line-height: 1.5; font-size: 0.96rem; }
   .refresh { color: var(--muted); text-align: right; min-width: 220px; font-size: 0.82rem; line-height: 1.45; }
   .refresh strong { display: block; color: var(--text); margin-top: 6px; font-size: 0.9rem; font-weight: 650; }
-  .overview { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px; margin: 24px 0; background: var(--border); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
-  .overview-item { background: rgba(21, 21, 19, 0.94); padding: 18px; min-width: 0; }
+  .range-select { background: var(--panel-soft); border: 1px solid var(--border); color: var(--text); padding: 4px 8px; border-radius: 6px; font-size: 0.8rem; margin-left: 8px; cursor: pointer; }
+  .range-select:hover { border-color: var(--border-strong); }
+  .overview { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px; margin: 16px 0; background: var(--border); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .overview-item { background: rgba(21, 21, 19, 0.94); padding: 14px 16px; min-width: 0; }
   .overview-item span { display: block; color: var(--muted); font-size: 0.78rem; margin-bottom: 10px; }
   .overview-item strong { display: block; color: var(--text); font-size: 1.55rem; line-height: 1.05; }
   .overview-item small { display: block; color: var(--faint); margin-top: 9px; line-height: 1.35; }
-  .model-stack { display: grid; gap: 20px; }
-  .model-panel { background: rgba(21, 21, 19, 0.96); border: 1px solid var(--border); border-radius: 8px; padding: 24px; }
+  .model-stack { display: grid; gap: 16px; }
+  .model-panel { background: rgba(21, 21, 19, 0.96); border: 1px solid var(--border); border-radius: 8px; padding: 18px; }
   .model-panel.status-up { border-color: rgba(123, 216, 143, 0.34); }
   .model-panel.status-down { border-color: rgba(255, 111, 97, 0.44); }
-  .model-header { display: flex; justify-content: space-between; gap: 24px; padding-bottom: 20px; border-bottom: 1px solid var(--border); }
+  .model-header { display: flex; justify-content: space-between; gap: 20px; padding-bottom: 14px; border-bottom: 1px solid var(--border); }
   .model-heading { display: flex; gap: 12px; min-width: 0; }
   .status-dot { width: 10px; height: 10px; border-radius: 5px; margin-top: 9px; flex: 0 0 auto; background: var(--faint); box-shadow: 0 0 0 4px rgba(116, 111, 102, 0.16); }
   .status-up .status-dot { background: var(--green); box-shadow: 0 0 0 4px rgba(123, 216, 143, 0.13); }
@@ -843,28 +901,28 @@ function renderHealthPage(): Response {
   .badge-unknown { color: var(--muted); }
   .status-summary small { display: block; color: var(--muted); margin-top: 8px; font-size: 0.78rem; }
   .metrics { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); border-bottom: 1px solid var(--border); }
-  .metric { min-width: 0; padding: 18px 16px 18px 0; border-right: 1px solid var(--border); }
+  .metric { min-width: 0; padding: 14px 14px 14px 0; border-right: 1px solid var(--border); }
   .metric:last-child { border-right: 0; padding-right: 0; }
   .metric span { display: block; color: var(--muted); font-size: 0.78rem; margin-bottom: 8px; }
   .metric strong { display: block; color: var(--text); font-size: 1.42rem; line-height: 1.08; font-weight: 720; overflow-wrap: anywhere; }
   .metric small { display: block; color: var(--faint); margin-top: 8px; line-height: 1.35; font-size: 0.78rem; }
   .metric-good strong { color: var(--green); }
   .metric-bad strong { color: var(--red); }
-  .history-row { padding: 20px 0; border-bottom: 1px solid var(--border); }
+  .history-row { padding: 16px 0; border-bottom: 1px solid var(--border); }
   .section-heading, .chart-heading { display: flex; justify-content: space-between; gap: 18px; align-items: flex-start; }
   .section-heading h3, .chart-heading h3 { font-size: 0.98rem; line-height: 1.2; letter-spacing: 0; }
   .section-heading p, .chart-heading p { color: var(--muted); margin-top: 6px; line-height: 1.45; font-size: 0.82rem; }
   .section-heading span, .chart-heading span { color: var(--faint); font-size: 0.78rem; white-space: nowrap; }
-  .status-strip { display: grid; grid-template-columns: repeat(168, minmax(2px, 1fr)); gap: 2px; height: 34px; margin-top: 15px; }
+  .status-strip { display: grid; gap: 2px; height: 28px; margin-top: 12px; }
   .history-bucket { border-radius: 2px; min-width: 2px; transition: opacity 0.15s ease; }
   .history-bucket:hover { opacity: 0.7; }
   .bucket-empty { background: var(--empty); }
   .bucket-ok { background: var(--green); }
   .bucket-mixed { background: var(--amber); }
   .bucket-down { background: var(--red); }
-  .charts { display: grid; grid-template-columns: 1.25fr 0.85fr; gap: 28px; padding-top: 22px; }
+  .charts { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; padding-top: 16px; }
   .chart-block { min-width: 0; }
-  .chart-canvas, .chart-empty { width: 100%; height: 172px; margin-top: 14px; border: 1px solid var(--border); border-radius: 8px; background: linear-gradient(180deg, rgba(244, 240, 232, 0.025), rgba(244, 240, 232, 0.008)); }
+  .chart-canvas, .chart-empty { width: 100%; height: 140px; margin-top: 12px; border: 1px solid var(--border); border-radius: 8px; background: linear-gradient(180deg, rgba(244, 240, 232, 0.025), rgba(244, 240, 232, 0.008)); }
   .chart-empty { display: grid; place-items: center; color: var(--muted); font-size: 0.86rem; }
   .chart-grid { stroke: var(--border-strong); stroke-width: 0.35; fill: none; vector-effect: non-scaling-stroke; }
   .chart-line { fill: none; stroke-width: 1.45; stroke-linecap: round; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
@@ -877,10 +935,10 @@ function renderHealthPage(): Response {
   .legend .line-latency { background: var(--text); }
   .legend .line-ttft { background: var(--amber); }
   .legend .line-tps { background: var(--green); }
-  .error-note { margin-top: 20px; padding-top: 18px; border-top: 1px solid var(--border); color: var(--red); font-size: 0.84rem; line-height: 1.45; overflow-wrap: anywhere; }
+  .error-note { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--border); color: var(--red); font-size: 0.84rem; line-height: 1.45; overflow-wrap: anywhere; }
   .error-note span { color: var(--muted); margin-right: 8px; }
   .ok-note { color: var(--muted); }
-  .footer { text-align: center; color: var(--faint); font-size: 0.78rem; margin-top: 32px; }
+  .footer { text-align: center; color: var(--faint); font-size: 0.78rem; margin-top: 24px; }
   @media (max-width: 980px) {
     .topbar, .model-header, .section-heading, .chart-heading { flex-direction: column; }
     .refresh, .status-summary { text-align: left; min-width: 0; }
@@ -905,25 +963,33 @@ function renderHealthPage(): Response {
     <div>
       <p class="eyebrow">Fireworks Proxy</p>
       <h1>Model health</h1>
-      <p class="subtitle">Tracking GLM 5 and Kimi K2.5 every 60 seconds. Metrics cover the last 7 days and are grouped into hourly buckets.</p>
+      <p class="subtitle">Tracking GLM 5 and Kimi K2.5 every 60 seconds. Showing ${rangeLabel} of metrics with dynamic buckets.</p>
     </div>
-    <div class="refresh">Auto-refreshes every 60 seconds<strong>${new Date().toLocaleString()}</strong></div>
+    <div class="refresh">Auto-refresh 60s <select id="range" class="range-select">${rangeOptions}</select><strong>${new Date().toLocaleString()}</strong></div>
   </header>
 
   <section class="overview" aria-label="Fleet overview">
     <div class="overview-item"><span>Models up</span><strong>${modelsUp}/${stats.length}</strong><small>Current status from the latest check per model</small></div>
     <div class="overview-item"><span>Fleet uptime</span><strong>${formatPercent(fleetUptime)}</strong><small>${successfulChecks}/${totalChecks} successful checks</small></div>
     <div class="overview-item"><span>Avg TPS</span><strong>${formatTps(fleetTpsValues.length ? average(fleetTpsValues, 1) : null)}</strong><small>Estimated from streamed health prompts</small></div>
-    <div class="overview-item"><span>Retention</span><strong>7 days</strong><small>${HEALTH_CHART_BUCKETS} hourly buckets per model</small></div>
+    <div class="overview-item"><span>Window</span><strong>${rangeLabel}</strong><small>${numBuckets} buckets of aggregated data</small></div>
   </section>
 
   <section class="model-stack" aria-label="Model status">
     ${modelPanels}
   </section>
 
-  <div class="footer">Window starts ${new Date(Date.now() - HEALTH_RETENTION_MS).toLocaleString()} - page refreshed ${new Date().toLocaleString()}</div>
+  <div class="footer">Window starts ${new Date(Date.now() - rangeMs).toLocaleString()} - page refreshed ${new Date().toLocaleString()}</div>
 </main>
-<script>setTimeout(() => location.reload(), 60000);</script>
+<script>
+const select = document.getElementById('range');
+select.addEventListener('change', (e) => {
+  const url = new URL(location.href);
+  url.searchParams.set('range', e.target.value);
+  location.href = url.toString();
+});
+setTimeout(() => location.reload(), 60000);
+</script>
 </body>
 </html>`;
 
@@ -942,7 +1008,7 @@ const server = Bun.serve({
 
     // Health dashboard (no auth required)
     if (path === "/health") {
-      return renderHealthPage();
+      return renderHealthPage(url.searchParams.get("range"));
     }
 
     // Everything else requires a valid proxy API key
