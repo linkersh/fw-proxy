@@ -1,11 +1,26 @@
 import { Database } from "bun:sqlite";
-import { ALLOWED_MODELS, ALLOWED_MODEL_IDS } from "./models";
+import {
+  ALLOWED_MODELS,
+  ALLOWED_MODEL_IDS,
+  PROVIDERS,
+  getModel,
+  getProviderConfig,
+  ProviderName,
+  ModelDefinition,
+} from "./models";
 
-const FIREWORKS_BASE = "https://api.fireworks.ai/inference/v1";
-const API_KEY = process.env.FIREWORKS_API_KEY;
+// Validate provider API keys
+const API_KEYS: Record<ProviderName, string | undefined> = {
+  fireworks: process.env.FIREWORKS_API_KEY,
+  minimax: process.env.MINIMAX_API_KEY,
+};
 
-if (!API_KEY) {
-  console.error("❌ FIREWORKS_API_KEY not set in .env");
+const missingKeys = Object.entries(API_KEYS)
+  .filter(([, key]) => !key)
+  .map(([provider]) => provider);
+
+if (missingKeys.length > 0) {
+  console.error(`❌ Missing API keys in .env: ${missingKeys.map((p) => `${p.toUpperCase()}_API_KEY`).join(", ")}`);
   process.exit(1);
 }
 
@@ -53,8 +68,8 @@ function getChartBuckets(rangeMs: number): number {
   return 168; // 7d -> 168 buckets (1h each)
 }
 const HEALTH_MODEL_IDS = new Set([
-  "accounts/fireworks/routers/glm-5-fast",
-  "accounts/fireworks/routers/kimi-k2p5-turbo",
+  "fireworks/glm-5",
+  "fireworks/kimi-k2.5",
 ]);
 
 // ---------- database ----------
@@ -177,17 +192,33 @@ async function readHealthStreamMetrics(
   return { ttft_ms: ttft, tps };
 }
 
-async function runHealthCheck(model: string): Promise<HealthResult> {
+async function runHealthCheck(modelId: string): Promise<HealthResult> {
   const start = Date.now();
+  const modelDef = getModel(modelId);
+  
+  if (!modelDef) {
+    return {
+      model: modelId,
+      status: 0,
+      latency_ms: 0,
+      ttft_ms: null,
+      tps: null,
+      error: "Model not found in configuration",
+    };
+  }
+  
+  const provider = getProviderConfig(modelDef.provider);
+  const apiKey = API_KEYS[modelDef.provider];
+  
   try {
-    const res = await fetch(`${FIREWORKS_BASE}/chat/completions`, {
+    const res = await fetch(`${provider.baseUrl}/chat/completions`, {
       method: "POST",
       headers: {
-        "Authorization": `Bearer ${API_KEY}`,
+        "Authorization": `Bearer ${apiKey}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model,
+        model: modelDef.providerModelId,
         messages: [{ role: "user", content: "Write one concise 30-word health check sentence." }],
         stream: true,
         max_tokens: 48,
@@ -206,7 +237,7 @@ async function runHealthCheck(model: string): Promise<HealthResult> {
 
     const latency = Date.now() - start;
     const result: HealthResult = {
-      model,
+      model: modelId,
       status: res.status,
       latency_ms: latency,
       ttft_ms: ttft,
@@ -216,7 +247,7 @@ async function runHealthCheck(model: string): Promise<HealthResult> {
     return result;
   } catch (err: any) {
     return {
-      model,
+      model: modelId,
       status: 0,
       latency_ms: Date.now() - start,
       ttft_ms: null,
@@ -243,8 +274,9 @@ async function runAllHealthChecks() {
 }
 
 // Start the health check loop
-setTimeout(() => runAllHealthChecks(), 2000); // initial after 2s
-setInterval(runAllHealthChecks, HEALTH_INTERVAL_MS);
+// DISABLED: Health tracking is currently disabled
+// setTimeout(() => runAllHealthChecks(), 2000); // initial after 2s
+// setInterval(runAllHealthChecks, HEALTH_INTERVAL_MS);
 
 // ---------- auth ----------
 
@@ -301,7 +333,7 @@ function extractModel(body: string): string | null {
 function validateModel(
   model: string | null,
   body: string
-): { valid: true } | { valid: false; error: Response } {
+): { valid: true; modelDef: ModelDefinition } | { valid: false; error: Response } {
   if (!model) {
     return {
       valid: false,
@@ -309,7 +341,8 @@ function validateModel(
     };
   }
 
-  if (!ALLOWED_MODEL_IDS.has(model)) {
+  const modelDef = getModel(model);
+  if (!modelDef) {
     return {
       valid: false,
       error: openaiError(
@@ -321,7 +354,6 @@ function validateModel(
 
   // Check image support: if the model doesn't support images but the request
   // contains image_url content parts, reject it
-  const modelDef = ALLOWED_MODELS.find((m) => m.id === model)!;
   if (!modelDef.input.includes("image")) {
     try {
       const json = JSON.parse(body);
@@ -344,18 +376,19 @@ function validateModel(
         }
       }
     } catch {
-      // If we can't parse, just let it through to Fireworks and let them handle it
+      // If we can't parse, just let it through to the provider and let them handle it
     }
   }
 
-  return { valid: true };
+  return { valid: true, modelDef };
 }
 
-/** Rewrite the URL: strip /v1 prefix and all query params */
-function rewriteUrl(incoming: string): string {
+/** Rewrite the URL for the appropriate provider */
+function rewriteUrl(incoming: string, provider: ProviderName): string {
   const url = new URL(incoming, "http://placeholder");
   const path = url.pathname.replace(/^\/v1/, "");
-  return FIREWORKS_BASE + path;
+  const config = getProviderConfig(provider);
+  return config.baseUrl + path;
 }
 
 // ---------- route handlers ----------
@@ -367,7 +400,7 @@ function handleModels(): Response {
       id: m.id,
       object: "model",
       created: 0,
-      owned_by: "fireworks",
+      owned_by: m.provider,
       permission: [],
       root: m.id,
       parent: null,
@@ -384,19 +417,35 @@ async function proxyWithBody(req: Request): Promise<Response> {
 
   if (!validation.valid) return validation.error;
 
-  const targetUrl = rewriteUrl(req.url);
+  const modelDef = validation.modelDef;
+  const provider = getProviderConfig(modelDef.provider);
+  const apiKey = API_KEYS[modelDef.provider];
+  
+  // Rewrite the model ID in the body to the provider-specific ID if needed
+  let rewrittenBody = bodyText;
+  if (model !== modelDef.providerModelId) {
+    try {
+      const json = JSON.parse(bodyText);
+      json.model = modelDef.providerModelId;
+      rewrittenBody = JSON.stringify(json);
+    } catch {
+      // If we can't parse, just use the original body
+    }
+  }
+  
+  const targetUrl = rewriteUrl(req.url, modelDef.provider);
   const headers = new Headers();
-  headers.set("Authorization", `Bearer ${API_KEY}`);
+  headers.set("Authorization", `Bearer ${apiKey}`);
   headers.set("Content-Type", "application/json");
   // Only forward Accept from client — nothing else
   if (req.headers.has("Accept")) headers.set("Accept", req.headers.get("Accept")!);
 
-  const isStream = bodyText.includes('"stream":true') || bodyText.includes('"stream": true');
+  const isStream = rewrittenBody.includes('"stream":true') || rewrittenBody.includes('"stream": true');
 
   const upstream = await fetch(targetUrl, {
     method: req.method,
     headers,
-    body: bodyText,
+    body: rewrittenBody,
   });
 
   if (!upstream.ok && !isStream) {
@@ -418,7 +467,7 @@ async function proxyWithBody(req: Request): Promise<Response> {
   if (isStream && upstream.body) {
     cleanHeaders.set("Content-Type", "text/event-stream");
     cleanHeaders.set("Cache-Control", "no-cache");
-    // Pipe Fireworks stream directly — they already put reasoning_content in delta
+    // Pipe provider stream directly
     return new Response(upstream.body, {
       status: upstream.status,
       headers: cleanHeaders,
@@ -837,7 +886,7 @@ function renderHealthPage(rangeParam: string | null): Response {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Fireworks Proxy - Status</title>
+<title>Multi-Provider Proxy - Status</title>
 <style>
   :root {
     color-scheme: dark;
@@ -967,9 +1016,9 @@ function renderHealthPage(rangeParam: string | null): Response {
 <main class="shell">
   <header class="topbar">
     <div>
-      <p class="eyebrow">Fireworks Proxy</p>
+      <p class="eyebrow">Multi-Provider Proxy</p>
       <h1>Model health</h1>
-      <p class="subtitle">Tracking GLM 5 and Kimi K2.5 every 60 seconds. Showing ${rangeLabel} of metrics with dynamic buckets.</p>
+      <p class="subtitle">Tracking ${stats.length} models from ${Object.keys(PROVIDERS).length} providers every 60 seconds. Showing ${rangeLabel} of metrics with dynamic buckets.</p>
     </div>
     <div class="refresh">Auto-refresh 60s <select id="range" class="range-select">${rangeOptions}</select><strong>${new Date().toLocaleString()}</strong></div>
   </header>
@@ -1050,7 +1099,7 @@ const server = Bun.serve({
 });
 
 console.log(`
-🚀 Fireworks proxy running on http://localhost:${PORT}
+🚀 Multi-provider proxy running on http://localhost:${PORT}
 
    OpenAI-compatible endpoints:
      POST /v1/chat/completions
@@ -1062,6 +1111,9 @@ console.log(`
 
    Authentication: Bearer <proxy-api-key> (${PROXY_KEYS.size} key(s) configured)
 
-   Allowed models:
+   Providers configured:
+${Object.entries(PROVIDERS).map(([name, config]) => `     • ${name} (${config.baseUrl})`).join("\n")}
+
+   Allowed models (format: provider/model-name):
 ${ALLOWED_MODELS.map((m) => `     • ${m.id} (${m.name}) [${m.input.join(", ")}]`).join("\n")}
 `);
